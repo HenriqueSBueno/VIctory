@@ -542,19 +542,49 @@ impl State {
                 }
                 return false;
             }
-            if let Some((param, dwords)) = stage.user_data {
+            if let Some((param, dwords, cbv)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     values[u.index as usize] = resolve_user_dword(u, &made, || {
                         self.user_value(compute, u.slot, u.root, u.dword)
                     });
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if cbv {
+                    let Some((gpu, to)) = list.scratch(u64::from(dwords) * 4) else {
+                        return false;
+                    };
+                    // SAFETY: `scratch` allocates at least `dwords * 4` bytes of live
+                    // upload memory (256-byte aligned) until the list resets; an open list.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            values.as_ptr().cast::<u8>(),
+                            to,
+                            values.len() * 4,
+                        );
+                        if compute {
+                            l.SetComputeRootConstantBufferView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootConstantBufferView(param, gpu);
+                        }
+                    }
+                } else {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(
+                                param,
+                                dwords,
+                                values.as_ptr().cast(),
+                                0,
+                            );
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(
+                                param,
+                                dwords,
+                                values.as_ptr().cast(),
+                                0,
+                            );
+                        }
                     }
                 }
             }

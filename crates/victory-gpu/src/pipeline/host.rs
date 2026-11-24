@@ -246,11 +246,33 @@ const QUADS: i32 = 32;
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
-    /// The root parameter of its user data, and its size in dwords.
-    pub(crate) user_data: Option<(u32, u32)>,
+    /// The root parameter of its user data, its size in dwords, and whether it
+    /// is bound as a root CBV (when root constants would exceed 64 root DWORDs).
+    pub(crate) user_data: Option<(u32, u32, bool)>,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+}
+
+/// D3D12 root signatures hold at most 64 DWORDs (`Constants` take `dwords`,
+/// root descriptors take 2). Marks stages whose user data must use a root CBV
+/// so the total fits within 64 DWORDs.
+fn cbv_user_data_stages(stage_dwords: &[u32], views_cost: u32) -> Vec<bool> {
+    let mut cbv = vec![false; stage_dwords.len()];
+    let mut total = stage_dwords.iter().sum::<u32>() + views_cost;
+    while total > 64 {
+        let Some((idx, _)) = stage_dwords
+            .iter()
+            .enumerate()
+            .filter(|&(i, &d)| !cbv[i] && d > 2)
+            .max_by_key(|&(_, &d)| d)
+        else {
+            break;
+        };
+        cbv[idx] = true;
+        total -= stage_dwords[idx] - 2;
+    }
+    cbv
 }
 
 impl Stage {
@@ -339,11 +361,28 @@ impl HostPipeline {
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
+        let stage_dwords: Vec<u32> = stages
+            .iter()
+            .filter_map(|&(s, _)| s.translated().map(|t| t.host.user_data_dwords()))
+            .collect();
+        let has_view_heap = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_heap));
+        let views_cost: u32 = stages
+            .iter()
+            .filter_map(|&(s, _)| {
+                let t = &s.translated()?.host;
+                Some(2 * (t.root_cbvs.len() + t.root_srvs.len()) as u32)
+            })
+            .sum::<u32>()
+            + if has_view_heap { 2 } else { 0 };
+        let use_cbv = cbv_user_data_stages(&stage_dwords, views_cost);
+
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         let mut view_heap = None;
-        for &(shader, visibility) in &stages {
+        for (stage_idx, &(shader, visibility)) in stages.iter().enumerate() {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
@@ -353,17 +392,32 @@ impl HostPipeline {
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
+                let cbv = use_cbv[stage_idx];
+                stage.user_data = Some((params.len() as u32, dwords, cbv));
+                params.push(if cbv {
+                    D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: 0,
+                                RegisterSpace: USER_DATA_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
                         },
-                    },
-                    ShaderVisibility: visibility,
+                        ShaderVisibility: visibility,
+                    }
+                } else {
+                    D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Constants: D3D12_ROOT_CONSTANTS {
+                                ShaderRegister: 0,
+                                RegisterSpace: USER_DATA_SPACE,
+                                Num32BitValues: dwords,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    }
                 });
             }
             for (slots, kind, out) in [
@@ -697,5 +751,20 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cbv_user_data_stages_keeps_constants_under_64_and_switches_above() {
+        // Spilled >16 dwords (e.g. 36) fitting in 64 DWORDs stays root constants.
+        assert_eq!(cbv_user_data_stages(&[36], 4), vec![false]);
+        // Exceeding 64 DWORDs switches the largest stage(s) to a 2-DWORD root CBV.
+        assert_eq!(cbv_user_data_stages(&[68], 0), vec![true]);
+        assert_eq!(cbv_user_data_stages(&[36, 36], 0), vec![false, true]);
+        assert_eq!(cbv_user_data_stages(&[60, 4], 4), vec![true, false]);
     }
 }
