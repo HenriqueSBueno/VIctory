@@ -114,6 +114,10 @@ extern "system" fn creation_flags(this: This) -> u32 {
     fence(this).flags
 }
 /// Where the value lives (GPU addresses are CPU addresses).
+/// Where the fence's value lives, for waits on it.
+pub(crate) fn value_address(this: This) -> u64 {
+    gpu_address(this)
+}
 extern "system" fn gpu_address(this: This) -> u64 {
     (&raw const fence(this).value) as u64
 }

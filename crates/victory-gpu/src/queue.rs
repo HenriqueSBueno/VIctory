@@ -445,6 +445,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             ListStep::Cpu(ops) => run_cpu_ops(&ops),
             ListStep::Wait(w) => {
                 if !w.satisfied() {
+                    note_held("command-list memory wait");
                     deferred_tail.push(PendingAction::Wait(w));
                     deferred_tail.extend(iter.map(PendingAction::from));
                     break;
@@ -518,9 +519,47 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     crate::fence::signal(fence, value)
 }
-/// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+/// A GPU-side fence wait: the queue's later work is held until the fence
+/// reaches `value`. It is the same as a 64-bit memory wait on the fence's
+/// value (GREATER_EQUAL), so it joins the queue's pending stream and the
+/// wait scheduler releases it. `VICTORY_QUEUE_WAITS=0` restores the old
+/// behaviour (the wait never blocks).
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    if std::env::var("VICTORY_QUEUE_WAITS").is_ok_and(|v| v.trim() == "0") {
+        return S_OK;
+    }
+    const GREATER_EQUAL: u32 = 7;
+    let w = crate::list::MemoryWait {
+        address: crate::fence::value_address(fence),
+        comparison: GREATER_EQUAL,
+        reference: value,
+    };
+    let state = &queue(this).state;
+    let mut inner = state.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if !inner.is_busy() && w.satisfied() {
+        return S_OK;
+    }
+    inner.items.push_back(PendingAction::Wait(w));
+    state.busy.store(true, Ordering::Release);
+    drop(inner);
+    note_held("queue fence wait");
+    register_pending(state.clone());
+    S_OK
+}
+
+/// Diagnostics: counts the waits that held work back, logged at powers of
+/// two so a run shows whether the ordering ever mattered.
+fn note_held(kind: &'static str) {
+    static QUEUE: AtomicUsize = AtomicUsize::new(0);
+    static LIST: AtomicUsize = AtomicUsize::new(0);
+    let counter = if kind == "queue fence wait" { &QUEUE } else { &LIST };
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(kind, held = n, "a wait held queue work back");
+    }
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
