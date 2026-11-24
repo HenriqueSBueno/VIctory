@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{HEAP_SRV_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -271,6 +271,9 @@ pub(crate) struct HostPipeline {
     /// Descriptor table ranges of the title root signature this pipeline was
     /// built with (fallback if the command list did not set a root signature).
     pub(crate) title_root: Option<Arc<crate::root::RootTables>>,
+    /// Root parameter of the raw view-heap SRV (`t0` in `HEAP_SRV_SPACE`), if
+    /// any stage reads view descriptor-heap memory as plain numeric data.
+    pub(crate) view_heap: Option<u32>,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
@@ -339,6 +342,7 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut view_heap = None;
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
@@ -408,6 +412,23 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        if stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_heap))
+        {
+            view_heap = Some(params.len() as u32);
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: HEAP_SRV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -455,6 +476,7 @@ impl HostPipeline {
                 pso,
                 root,
                 title_root,
+                view_heap,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -488,6 +510,7 @@ impl HostPipeline {
                 pso,
                 root,
                 title_root,
+                view_heap,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -559,6 +582,7 @@ impl HostPipeline {
             pso,
             root,
             title_root,
+            view_heap,
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),

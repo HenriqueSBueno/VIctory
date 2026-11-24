@@ -162,11 +162,63 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// Root table slots that hold descriptors (excluding tables read only as raw data).
+fn descriptor_table_slots(used: &[UsedResource], descriptor_tables: &[u8]) -> Vec<u8> {
+    let mut slots: Vec<u8> = used
+        .iter()
+        .filter(|u| u.root == RootType::Table)
+        .map(|u| u.slot)
+        .chain(descriptor_tables.iter().copied())
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+/// Chooses the host user-data dword for `u`: descriptor-table accesses take
+/// any dynamic (`Fresh`) offset override, while raw-data table accesses
+/// (`dword != 0`) and non-table roots keep the original value.
+fn resolve_user_dword(
+    u: &victory_shader::emit::UserData,
+    made: &[(u8, u32)],
+    original: impl FnOnce() -> u32,
+) -> u32 {
+    if u.root == RootType::Table
+        && u.dword == 0
+        && let Some(&(_, offset)) = made.iter().find(|m| m.0 == u.slot)
+    {
+        offset
+    } else {
+        original()
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Host GPU address of the bound view descriptor heap's shadow SRV,
+/// refreshed for the current list, or `None` if no valid shadow backs it.
+fn view_heap_srv(list: &HostList, heap_ptr: usize) -> Option<u64> {
+    if heap_ptr == 0 {
+        once!("a shader reads view-heap data with no view descriptor heap bound");
+        return None;
+    }
+    let heap = crate::descriptor::heap(heap_ptr as This);
+    let size = heap.bytes();
+    let Some(shadow) = crate::shadow::find(heap.start, size) else {
+        once!(
+            start = format_args!("{:#x}", heap.start),
+            size,
+            "view descriptor heap outside shadow memory"
+        );
+        return None;
+    };
+    shadow.refresh(list, heap.start, size);
+    Some(shadow.gpu(heap.start))
 }
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -474,8 +526,7 @@ impl State {
             self.table_failed = false;
             let made = self.tables(
                 list,
-                &t.used,
-                &t.host.user_data,
+                t,
                 title_root.as_deref(),
                 compute,
                 &mut scanned_static,
@@ -494,13 +545,9 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
-                    };
+                    values[u.index as usize] = resolve_user_dword(u, &made, || {
+                        self.user_value(compute, u.slot, u.root, u.dword)
+                    });
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -530,6 +577,19 @@ impl State {
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                         }
                     }
+                }
+            }
+        }
+        if let Some(param) = p.view_heap {
+            let Some(gpu) = view_heap_srv(list, self.heaps[0]) else {
+                return false;
+            };
+            // SAFETY: an open list; `gpu` addresses the view-heap shadow SRV.
+            unsafe {
+                if compute {
+                    l.SetComputeRootShaderResourceView(param, gpu);
+                } else {
+                    l.SetGraphicsRootShaderResourceView(param, gpu);
                 }
             }
         }
@@ -589,9 +649,11 @@ impl State {
             for u in &t.host.user_data {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
-                if let (RootType::Table, Some(Root::Table(handle))) =
-                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
-                    && self.heaps[0] != 0
+                if let (RootType::Table, true, Some(Root::Table(handle))) = (
+                    u.root,
+                    u.dword == 0 && t.host.descriptor_tables.contains(&u.slot),
+                    self.roots_ref(compute).get(usize::from(u.slot)),
+                ) && self.heaps[0] != 0
                     && crate::descriptor::heap(self.heaps[0] as This)
                         .index(*handle)
                         .is_some()
@@ -617,6 +679,10 @@ impl State {
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
             }
+        }
+        if p.view_heap.is_some() && self.heaps[0] != 0 {
+            let heap = crate::descriptor::heap(self.heaps[0] as This);
+            let _ = write!(text, " view_heap={:#x}+{}", heap.start, heap.bytes());
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
         text
@@ -670,30 +736,17 @@ impl State {
     fn tables(
         &mut self,
         list: &HostList,
-        used: &[UsedResource],
-        user_data: &[victory_shader::emit::UserData],
+        t: &crate::pipeline::Translated,
         root_tables: Option<&crate::root::RootTables>,
         compute: bool,
         scanned_static: &mut Vec<u8>,
     ) -> Vec<(u8, u32)> {
         use crate::descriptor::host::{TablePlan, UsedSlot, plan_table, slot_sync};
 
-        let mut table_slots: Vec<u8> = used
-            .iter()
-            .filter(|u| u.root == RootType::Table)
-            .map(|u| u.slot)
-            .chain(
-                user_data
-                    .iter()
-                    .filter(|u| u.root == RootType::Table)
-                    .map(|u| u.slot),
-            )
-            .collect();
+        let table_slots = descriptor_table_slots(&t.used, &t.host.descriptor_tables);
         if table_slots.is_empty() {
             return Vec::new();
         }
-        table_slots.sort_unstable();
-        table_slots.dedup();
 
         let (active_targets, active_depth): (&[usize], usize) = if compute {
             (&[], 0)
@@ -713,13 +766,16 @@ impl State {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
-            let user_index = user_data
+            let user_index = t
+                .host
+                .user_data
                 .iter()
-                .find(|u| u.root == RootType::Table && u.slot == slot)
+                .find(|u| u.root == RootType::Table && u.slot == slot && u.dword == 0)
                 .map(|u| u.index);
             let step = heap.step();
             let slot_dwords = (step / 4).max(1);
-            let entries: Vec<&UsedResource> = used
+            let entries: Vec<&UsedResource> = t
+                .used
                 .iter()
                 .filter(|u| u.root == RootType::Table && u.slot == slot)
                 .collect();
@@ -1528,5 +1584,48 @@ mod tests {
         assert_eq!(range_kind_at(&ranges, 2), Some(ResourceType::Uav));
         assert_eq!(range_kind_at(&ranges, 5), Some(ResourceType::Uav));
         assert_eq!(range_kind_at(&ranges, 6), None);
+    }
+
+    #[test]
+    fn descriptor_table_filtering_and_mixed_user_data_preserve_raw_heap_offset() {
+        use victory_shader::emit::UserData;
+
+        let used = [UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            user_data: 0,
+            slot: 0,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            dwords: 4,
+            stride: 0,
+        }];
+        // Slot 2 is read only as raw view-heap data (absent from both `used` and
+        // `descriptor_tables`); slot 1 is a dynamically indexed descriptor table.
+        assert_eq!(descriptor_table_slots(&used, &[0, 1]), vec![0, 1]);
+
+        let desc_ud = UserData {
+            index: 0,
+            slot: 0,
+            root: RootType::Table,
+            dword: 0,
+        };
+        let raw_mixed_ud = UserData {
+            index: 1,
+            slot: 0,
+            root: RootType::Table,
+            dword: 1,
+        };
+        let data_only_ud = UserData {
+            index: 2,
+            slot: 2,
+            root: RootType::Table,
+            dword: 0,
+        };
+        let made = [(0u8, 0x200u32)];
+
+        assert_eq!(resolve_user_dword(&desc_ud, &made, || 0x80), 0x200);
+        assert_eq!(resolve_user_dword(&raw_mixed_ud, &made, || 0x80), 0x80);
+        assert_eq!(resolve_user_dword(&data_only_ud, &made, || 0x140), 0x140);
     }
 }

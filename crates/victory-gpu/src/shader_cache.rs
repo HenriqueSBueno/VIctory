@@ -247,6 +247,9 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    out.push(u8::from(s.view_heap));
+    word(&mut out, s.descriptor_tables.len() as u32);
+    out.extend(&s.descriptor_tables);
     out
 }
 
@@ -257,6 +260,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             let (head, rest) = self.0.split_at_checked(n)?;
             self.0 = rest;
             Some(head)
+        }
+        fn byte(&mut self) -> Option<u8> {
+            self.take(1).map(|b| b[0])
         }
         fn word(&mut self) -> Option<u32> {
             Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
@@ -303,6 +309,12 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let view_heap = match r.byte()? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let descriptor_tables = r.list()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -311,6 +323,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        view_heap,
+        descriptor_tables,
     })
 }
 
@@ -337,6 +351,8 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            view_heap: true,
+            descriptor_tables: vec![1, 4],
         }
     }
 
@@ -414,5 +430,22 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn view_heap_and_descriptor_tables_round_trip_and_validate_flag() {
+        for (view_heap, descriptor_tables) in [(false, vec![]), (true, vec![0, 3, 7])] {
+            let mut s = shader();
+            s.view_heap = view_heap;
+            s.descriptor_tables = descriptor_tables;
+            let bytes = encode(&s);
+            assert_eq!(decode(&bytes), Some(s));
+        }
+
+        // Corrupt the 1-byte `view_heap` flag (before the 4-byte `descriptor_tables` len).
+        let mut bad = encode(&shader());
+        let flag_at = bad.len() - (4 + shader().descriptor_tables.len()) - 1;
+        bad[flag_at] = 2;
+        assert_eq!(decode(&bad), None);
     }
 }

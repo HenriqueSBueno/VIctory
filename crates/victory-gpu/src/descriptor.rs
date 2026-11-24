@@ -84,6 +84,12 @@ impl Heap {
         self.desc.count
     }
 
+    /// Total bytes of descriptor heap backing memory.
+    #[cfg(windows)]
+    pub(crate) fn bytes(&self) -> u64 {
+        u64::from(self.step()) * u64::from(self.desc.count.max(1))
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
@@ -325,6 +331,12 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
+        if self.memory.is_some()
+            && self.desc.kind == VIEWS_KIND
+            && self.desc.flags & SHADER_VISIBLE != 0
+        {
+            crate::shadow::unregister(at, self.start);
+        }
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
@@ -805,16 +817,22 @@ pub(crate) extern "system" fn create_heap(
     // interface version; find the flag that tells them apart if a title
     // trips over this.
     let placed = placement.address != 0 && placement.size == size;
+    let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
+    let view_watched = !placed && visible && desc.kind == VIEWS_KIND;
     tracing::debug!(?desc, placed, "descriptor heap");
     let (start, memory) = if placed {
         (placement.address, None)
+    } else if view_watched {
+        match Memory::zeroed_watched(size) {
+            Ok(memory) => (memory.address(), Some(memory)),
+            Err(hr) => return hr,
+        }
     } else {
         match Memory::zeroed(size, 64) {
             Ok(memory) => (memory.address(), Some(memory)),
             Err(hr) => return hr,
         }
     };
-    let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
@@ -828,11 +846,14 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
+        if view_watched {
+            crate::shadow::register(at, start, size);
+        }
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
-    let _ = visible;
+    let _ = (visible, view_watched);
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
@@ -1045,5 +1066,76 @@ mod tests {
             format_dwords(&dwords),
             "[0x00000000, 0x00000001, 0x1234abcd, 0xffffffff, 0x00000010, 0x00000020, 0x00000030, 0x00000040]"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_placed_shader_visible_view_heap_registers_watched_shadow_and_reads_slot_dwords() {
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 128,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let view_heap = heap(h);
+        assert_eq!(view_heap.bytes(), 128 * 32);
+        let start = view_heap.start;
+        assert!(crate::shadow::is_registered(h as usize, start));
+        let shadow = crate::shadow::find(start, view_heap.bytes()).expect("view heap shadow");
+        assert_eq!(shadow.left(start), view_heap.bytes());
+
+        let slot3_off = 3 * 32u64;
+        let payload = [
+            1.0f32.to_bits(),
+            6500.0f32.to_bits(),
+            0.25f32.to_bits(),
+            0x3f80_0000u32,
+        ];
+        // SAFETY: slot 3 (offset 96..112) lies within the 128 * 32 byte view heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                (start + slot3_off) as *mut u32,
+                payload.len(),
+            );
+        }
+        assert_eq!(view_heap.index(start + slot3_off), Some(3));
+        assert_eq!(
+            (start + slot3_off) - slot::<extern "system" fn(This) -> u64>(h, 0x50)(h),
+            slot3_off
+        );
+        let Some((now, spans)) =
+            crate::watch::writes(start as usize, (start + view_heap.bytes()) as usize, false)
+        else {
+            panic!("expected MEM_WRITE_WATCH dirty spans");
+        };
+        let page = (start as usize) / crate::watch::PAGE;
+        assert!(
+            spans.contains(&(page, now)),
+            "expected page {page} at asking {now} in {spans:?}"
+        );
+
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!crate::shadow::is_registered(h as usize, start));
+
+        // Sampler heaps do not register a view-heap data shadow.
+        let sampler_desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut sh = std::ptr::null();
+        assert_eq!(create(sampler_desc, none, &mut sh), S_OK);
+        let sampler_heap = heap(sh);
+        assert_eq!(sampler_heap.bytes(), 64 * 16);
+        assert!(!crate::shadow::is_registered(sh as usize, sampler_heap.start));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(sh, 0x10)(sh), 0);
     }
 }

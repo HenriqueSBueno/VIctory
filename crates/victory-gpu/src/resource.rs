@@ -815,6 +815,9 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    /// Allocated with `MEM_WRITE_WATCH` via `VirtualAlloc`, freed with `VirtualFree`.
+    #[cfg(windows)]
+    watched: bool,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -878,12 +881,54 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            #[cfg(windows)]
+            watched: false,
         })
     }
 
     /// `size` zeroed bytes aligned to `alignment` (a power of two).
     pub(crate) fn zeroed(size: u64, alignment: u64) -> Result<Memory, HRESULT> {
         Memory::new(AllocationInfo { size, alignment })
+    }
+
+    /// `size` zeroed bytes backed by write-watched virtual pages so `shadow`
+    /// can track dirty pages via `watch::writes` on Windows.
+    pub(crate) fn zeroed_watched(size: u64) -> Result<Memory, HRESULT> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            // `watch::writes` queries `GetWriteWatch` on `watch::PAGE` (64 KiB)
+            // boundaries; backing memory must span full 64 KiB blocks so small
+            // heaps do not query past the end of the `VirtualAlloc` region.
+            let len = usize::try_from(size)
+                .ok()
+                .filter(|&n| n > 0)
+                .and_then(|n| n.checked_next_multiple_of(crate::watch::PAGE))
+                .ok_or(E_INVALIDARG)?;
+            let layout = Layout::from_size_align(len, 64).map_err(|_| E_INVALIDARG)?;
+            // SAFETY: null base reserves and commits zeroed private pages with
+            // write-watch enabled; freed with `VirtualFree(..., 0, MEM_RELEASE)` on drop.
+            let raw = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    layout.size(),
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            };
+            let ptr = NonNull::new(raw.cast()).ok_or(E_OUTOFMEMORY)?;
+            Ok(Memory {
+                ptr,
+                layout,
+                attributes: None,
+                watched: true,
+            })
+        }
+        #[cfg(not(windows))]
+        Memory::zeroed(size, 64)
     }
 
     pub(crate) fn address(&self) -> u64 {
@@ -903,12 +948,21 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            #[cfg(windows)]
+            watched: false,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        if self.watched {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // SAFETY: allocated with `VirtualAlloc` in `zeroed_watched`.
+            unsafe { VirtualFree(self.ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.

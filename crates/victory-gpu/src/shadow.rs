@@ -393,6 +393,11 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+#[cfg(test)]
+pub(crate) fn is_registered(resource: usize, start: u64) -> bool {
+    buffers().contains_key(&(start, resource))
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
