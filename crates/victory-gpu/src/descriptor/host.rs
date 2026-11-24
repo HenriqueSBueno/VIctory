@@ -5,7 +5,8 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -13,11 +14,213 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+struct RetiredDynamic {
+    first: u32,
+    n: u32,
+    fence: u64,
+}
+
+struct DynamicState {
+    next: u32,
+    generation: u64,
+    taken: Vec<bool>,
+    slot_gen: Vec<u64>,
+    retired: Vec<RetiredDynamic>,
+}
+
+/// Ring allocator for dynamic descriptor slots past a heap's static mirror.
+/// Slots stay taken while their command list is recording or executing on the
+/// GPU; once the submission's fence completes (or if an unsubmitted list is
+/// reset or dropped), they become free, while `next` keeps advancing around the
+/// ring so recently released slots are reused last.
+pub(crate) struct DynamicPool {
+    capacity: u32,
+    completed_fence: AtomicU64,
+    state: Mutex<DynamicState>,
+}
+
+impl DynamicPool {
+    pub(crate) fn new(capacity: u32) -> Self {
+        Self {
+            capacity,
+            completed_fence: AtomicU64::new(0),
+            state: Mutex::new(DynamicState {
+                next: 0,
+                generation: 0,
+                taken: vec![false; capacity as usize],
+                slot_gen: vec![0; capacity as usize],
+                retired: Vec::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Reserves `n` consecutive free slots in the ring, returning their offset
+    /// and the allocation generation.
+    pub(crate) fn allocate(&self, n: u32) -> Option<(u32, u64)> {
+        if n == 0 || n > self.capacity {
+            return None;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let completed = self.completed_fence.load(Ordering::Acquire);
+        if !state.retired.is_empty() {
+            reclaim_retired(&mut state, completed);
+        }
+        let cap = self.capacity as usize;
+        let n_usize = n as usize;
+        // Search from `next` on, then from the start.
+        let starts = (state.next as usize..cap).chain(0..state.next as usize);
+        let mut run = 0;
+        let mut found = None;
+        let mut last = usize::MAX;
+        for at in starts {
+            // A run cannot wrap past the end.
+            if at != last.wrapping_add(1) {
+                run = 0;
+            }
+            last = at;
+            run = if state.taken[at] { 0 } else { run + 1 };
+            if run == n_usize {
+                found = Some(at + 1 - n_usize);
+                break;
+            }
+        }
+        let first = found?;
+        state.generation += 1;
+        let epoch = state.generation;
+        state.taken[first..first + n_usize].fill(true);
+        state.slot_gen[first..first + n_usize].fill(epoch);
+        state.next = ((first + n_usize) % cap) as u32;
+        Some((first as u32, epoch))
+    }
+
+    /// Gives back `[first, first + n)` immediately (list reset/dropped without
+    /// running on the GPU).
+    pub(crate) fn release_now(&self, first: u32, n: u32) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        free_range(&mut state.taken, first, n);
+    }
+
+    /// Gives back `[first, first + n)` once `fence` has completed on the GPU.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn release_at(&self, first: u32, n: u32, fence: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let completed = self.completed_fence.load(Ordering::Acquire);
+        if fence <= completed {
+            free_range(&mut state.taken, first, n);
+        } else {
+            state.retired.push(RetiredDynamic { first, n, fence });
+        }
+    }
+
+    /// Advances the known completed GPU fence and reclaims any retired ranges
+    /// that have passed it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn complete_fence(&self, completed: u64) {
+        self.completed_fence.fetch_max(completed, Ordering::AcqRel);
+        let latest = self.completed_fence.load(Ordering::Acquire);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.retired.is_empty() {
+            reclaim_retired(&mut state, latest);
+        }
+    }
+
+    /// Marks `completed` done on the GPU and releases `[first, first + n)`
+    /// along with any older retired ranges.
+    pub(crate) fn release_completed(&self, first: u32, n: u32, completed: u64) {
+        self.completed_fence.fetch_max(completed, Ordering::AcqRel);
+        let latest = self.completed_fence.load(Ordering::Acquire);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        free_range(&mut state.taken, first, n);
+        if !state.retired.is_empty() {
+            reclaim_retired(&mut state, latest);
+        }
+    }
+
+    /// Re-reserves `[first, first + n)` if no newer allocation has overwritten
+    /// any slot in it since generation `epoch` (for resubmitted closed lists).
+    pub(crate) fn try_reclaim(&self, first: u32, n: u32, epoch: u64) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(end) = first.checked_add(n).filter(|&e| e <= self.capacity) else {
+            return false;
+        };
+        let range = first as usize..end as usize;
+        if !state.slot_gen[range.clone()].iter().all(|&g| g == epoch) {
+            return false;
+        }
+        state
+            .retired
+            .retain(|r| r.first.saturating_add(r.n) <= first || end <= r.first);
+        state.taken[range].fill(true);
+        true
+    }
+
+    pub(crate) fn in_use(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .taken
+            .iter()
+            .filter(|&&t| t)
+            .count()
+    }
+}
+
+fn free_range(taken: &mut [bool], first: u32, n: u32) {
+    let end = first.saturating_add(n).min(taken.len() as u32) as usize;
+    if let Some(slots) = taken.get_mut(first as usize..end) {
+        slots.fill(false);
+    }
+}
+
+fn reclaim_retired(state: &mut DynamicState, completed: u64) {
+    let mut i = 0;
+    while i < state.retired.len() {
+        if state.retired[i].fence <= completed {
+            let r = state.retired.swap_remove(i);
+            free_range(&mut state.taken, r.first, r.n);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// A reservation of dynamic descriptor slots on a [`HostHeap`], held by a
+/// command list until its GPU submission completes or the list resets/drops.
+pub(crate) struct DynamicLease {
+    pool: Arc<DynamicPool>,
+    base: u32,
+    offset: u32,
+    n: u32,
+    epoch: u64,
+}
+
+impl DynamicLease {
+    pub(crate) fn first(&self) -> u32 {
+        self.base + self.offset
+    }
+
+    pub(crate) fn release_now(&self) {
+        self.pool.release_now(self.offset, self.n);
+    }
+
+    pub(crate) fn release_completed(&self, completed: u64) {
+        self.pool.release_completed(self.offset, self.n, completed);
+    }
+
+    pub(crate) fn try_reclaim(&self) -> bool {
+        self.pool.try_reclaim(self.offset, self.n, self.epoch)
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more.
+    /// Slots mirroring the title's; view heaps have extra dynamic slots.
     count: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -27,11 +230,8 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Number of dynamic slots appended past `count` (0 for sampler heaps).
-    dynamic: u32,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Dynamic descriptor slot allocator past `count` (capacity 0 for samplers).
+    pool: Arc<DynamicPool>,
 }
 
 impl Drop for HostHeap {
@@ -79,6 +279,14 @@ const DYNAMIC: u32 = 1 << 19;
 /// [`PORTABLE_VIEWS`].
 const DYNAMIC_CAPPED: u32 = 1 << 16;
 
+/// Static/dynamic slot split when a view heap hits [`PORTABLE_VIEWS`].
+/// Never exceeds the title's own count for the static mirror so smaller
+/// heaps get the remaining capacity as dynamic slots.
+fn capped_counts(title_count: u32) -> (u32, u32) {
+    let static_count = title_count.min(PORTABLE_VIEWS - DYNAMIC_CAPPED);
+    (static_count, PORTABLE_VIEWS - static_count)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -105,12 +313,15 @@ impl HostHeap {
             Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (
-                    make(PORTABLE_VIEWS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    DYNAMIC_CAPPED,
-                )
+                let (static_count, dynamic) = capped_counts(count);
+                tracing::warn!(
+                    error = %e,
+                    count,
+                    static_count,
+                    dynamic,
+                    "host view heap capped at {PORTABLE_VIEWS}"
+                );
+                (make(PORTABLE_VIEWS).ok()?, static_count, dynamic)
             }
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -141,8 +352,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            dynamic: extra,
-            next: Mutex::new((0, vec![false; extra as usize])),
+            pool: Arc::new(DynamicPool::new(extra)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -218,41 +428,63 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
-    /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
-    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+    /// Identity of this heap's dynamic slot pool (for list-local table reuse).
+    pub(crate) fn pool_id(&self) -> usize {
+        Arc::as_ptr(&self.pool) as usize
+    }
+
+    /// Number of dynamic slots in this heap (0 for sampler heaps).
+    #[cfg(test)]
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.pool.capacity()
+    }
+
+    /// Reserves `n` consecutive free dynamic slots (view heaps only), returned
+    /// as a lease whose slots are freed once the submission that uses them
+    /// completes on the GPU (or if the list resets/drops without running).
+    pub(crate) fn lease_dynamic(&self, n: u32) -> Option<DynamicLease> {
+        let cap = self.pool.capacity();
+        if self.sampler || n == 0 {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let cap = self.dynamic as usize;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..cap).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
+        if n > cap {
+            static TOO_BIG: std::sync::Once = std::sync::Once::new();
+            TOO_BIG.call_once(|| {
+                tracing::warn!(
+                    n,
+                    cap,
+                    "a table needs more dynamic descriptor slots than the heap has"
+                );
+            });
+            return None;
         }
-        let Some(first) = found else {
+        let Some((offset, epoch)) = self.pool.allocate(n) else {
+            let in_use = self.pool.in_use();
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, cap, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    n,
+                    cap,
+                    in_use,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % cap) as u32;
-        Some(self.count + first as u32)
+        Some(DynamicLease {
+            pool: Arc::clone(&self.pool),
+            base: self.count,
+            offset,
+            n,
+            epoch,
+        })
+    }
+
+    /// `n` consecutive free dynamic slots (view heaps only), taken until
+    /// [`HostHeap::release`]: the first's index.
+    #[cfg(test)]
+    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
+        self.lease_dynamic(n).map(|lease| lease.first())
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -265,15 +497,12 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.pool.release_now(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -942,5 +1171,91 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    #[test]
+    fn capped_split_preserves_smaller_title_heaps() {
+        assert_eq!(
+            capped_counts(1_245_184),
+            (PORTABLE_VIEWS - DYNAMIC_CAPPED, DYNAMIC_CAPPED)
+        );
+        assert_eq!(capped_counts(600_000), (600_000, 400_000));
+    }
+
+    #[test]
+    fn pool_waits_for_submission_fence_before_recycling() {
+        let pool = DynamicPool::new(16);
+        let (a, _) = pool.allocate(8).unwrap();
+        let (b, _) = pool.allocate(8).unwrap();
+        assert_eq!((a, b), (0, 8));
+        assert_eq!(pool.allocate(1), None);
+
+        // Retire both at fences 5 and 6; slots stay held until those fences complete.
+        pool.release_at(a, 8, 5);
+        pool.release_at(b, 8, 6);
+        assert_eq!(pool.allocate(4), None);
+        pool.complete_fence(4);
+        assert_eq!(pool.allocate(4), None);
+
+        // Fence 5 passes: `a` becomes reusable while `b` stays held for fence 6.
+        pool.complete_fence(5);
+        let (c, _) = pool.allocate(4).unwrap();
+        let (d, _) = pool.allocate(4).unwrap();
+        assert_eq!((c, d), (0, 4));
+        assert_eq!(pool.allocate(1), None);
+
+        // Fence 6 passes: `b` becomes reusable too.
+        pool.complete_fence(6);
+        assert_eq!(pool.allocate(8).map(|(at, _)| at), Some(8));
+    }
+
+    #[test]
+    fn pool_advances_around_ring_before_reusing_freed_slots() {
+        let pool = DynamicPool::new(16);
+        let (a, _) = pool.allocate(4).unwrap();
+        let (b, _) = pool.allocate(4).unwrap();
+        assert_eq!((a, b), (0, 4));
+
+        // Even after `a` finishes on the GPU, the ring cursor advances so `a` is reused last.
+        pool.release_completed(a, 4, 1);
+        let (c, _) = pool.allocate(4).unwrap();
+        let (d, _) = pool.allocate(4).unwrap();
+        assert_eq!((c, d), (8, 12));
+        // Now the ring wraps and reuses `a`.
+        assert_eq!(pool.allocate(4).map(|(at, _)| at), Some(0));
+    }
+
+    #[test]
+    fn pool_reclaims_resubmitted_slots_only_until_overwritten() {
+        let pool = DynamicPool::new(16);
+        let (a, gen_a) = pool.allocate(8).unwrap();
+        pool.release_completed(a, 8, 1);
+
+        // No later allocation touched 0..8 yet, so reclaim succeeds and holds the range again.
+        assert!(pool.try_reclaim(a, 8, gen_a));
+        assert_eq!(pool.allocate(10), None);
+        pool.release_completed(a, 8, 2);
+
+        // Allocating 8..16 still leaves 0..8 intact.
+        let (b, _) = pool.allocate(8).unwrap();
+        assert_eq!(b, 8);
+        assert!(pool.try_reclaim(a, 8, gen_a));
+        pool.release_completed(a, 8, 3);
+
+        // Wrapping around into 0..4 overwrites part of `a`, so reclaim refuses.
+        let (c, _) = pool.allocate(4).unwrap();
+        assert_eq!(c, 0);
+        assert!(!pool.try_reclaim(a, 8, gen_a));
+        // And refusing reclaim did not disturb `c` or free `b`.
+        assert_eq!(pool.in_use(), 12);
+    }
+
+    #[test]
+    fn pool_release_now_frees_unsubmitted_ranges() {
+        let pool = DynamicPool::new(16);
+        let (a, _) = pool.allocate(16).unwrap();
+        assert_eq!(pool.allocate(1), None);
+        pool.release_now(a, 8);
+        assert_eq!(pool.allocate(8).map(|(at, _)| at), Some(0));
     }
 }

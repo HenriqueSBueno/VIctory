@@ -294,31 +294,17 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Default)]
+struct DynamicLeases {
+    active: Vec<crate::descriptor::host::DynamicLease>,
+    released: Vec<crate::descriptor::host::DynamicLease>,
+}
 
-    #[test]
-    fn warp_adapter_accepts_only_software() {
-        // This probes DXGI without creating a D3D12 device or running a title.
-        // SAFETY: plain DXGI adapter queries.
-        let raw = unsafe {
-            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            else {
-                return;
-            };
-            factory.EnumWarpAdapter::<IDXGIAdapter>()
-        };
-        let Ok(raw) = raw else { return };
-        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
-        eprintln!(
-            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
-            desc.VendorId, desc.Flags
-        );
-        assert_eq!(
-            warp_adapter().is_ok(),
-            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
-        );
+impl Drop for DynamicLeases {
+    fn drop(&mut self) {
+        for lease in self.active.drain(..) {
+            lease.release_now();
+        }
     }
 }
 
@@ -345,6 +331,8 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Dynamic descriptor slot leases held until submission completion or reset.
+    dynamic: Mutex<DynamicLeases>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -525,6 +513,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                dynamic: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -546,6 +535,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
+            list.reclaim_dynamic();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -569,6 +559,8 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        let mut all_waited = true;
+        let mut last_completed = 0u64;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -582,8 +574,12 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
+                        last_completed = *submitted;
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        all_waited = false;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -618,6 +614,11 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        if all_waited && last_completed > 0 {
+            for list in runs {
+                list.release_dynamic(last_completed);
+            }
         }
         drop(retired);
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -923,6 +924,51 @@ impl HostList {
         }
     }
 
+    /// Records a dynamic descriptor slot lease held by commands in this list.
+    pub(crate) fn take_dynamic(&self, lease: crate::descriptor::host::DynamicLease) {
+        self.dynamic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .push(lease);
+    }
+
+    /// Re-reserves dynamic slots released by an earlier submission if this
+    /// closed list is submitted again before reset.
+    fn reclaim_dynamic(&self) {
+        let mut dynamic = self.dynamic.lock().unwrap_or_else(|e| e.into_inner());
+        if dynamic.released.is_empty() {
+            return;
+        }
+        let released = std::mem::take(&mut dynamic.released);
+        for lease in released {
+            if lease.try_reclaim() {
+                dynamic.active.push(lease);
+            } else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        "a closed command list was submitted again after its dynamic descriptor slots were reused"
+                    );
+                });
+            }
+        }
+    }
+
+    /// Releases dynamic slots held by this list once `completed` has passed on
+    /// the GPU, retaining leases in case the closed list is resubmitted.
+    fn release_dynamic(&self, completed: u64) {
+        let mut dynamic = self.dynamic.lock().unwrap_or_else(|e| e.into_inner());
+        if dynamic.active.is_empty() {
+            return;
+        }
+        let active = std::mem::take(&mut dynamic.active);
+        for lease in active {
+            lease.release_completed(completed);
+            dynamic.released.push(lease);
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -931,6 +977,13 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut dynamic = self.dynamic.lock().unwrap_or_else(|e| e.into_inner());
+            for lease in dynamic.active.drain(..) {
+                lease.release_now();
+            }
+            dynamic.released.clear();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -2020,8 +2073,59 @@ fn pump() {
 
 #[cfg(test)]
 mod tests {
-    use super::Batch;
+    use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn warp_adapter_accepts_only_software() {
+        // This probes DXGI without creating a D3D12 device or running a title.
+        // SAFETY: plain DXGI adapter queries.
+        let raw = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            factory.EnumWarpAdapter::<IDXGIAdapter>()
+        };
+        let Ok(raw) = raw else { return };
+        // SAFETY: `raw` is a live `IDXGIAdapter` returned by `EnumWarpAdapter`.
+        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        eprintln!(
+            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
+            desc.VendorId, desc.Flags
+        );
+        assert_eq!(
+            warp_adapter().is_ok(),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
+    }
+
+    #[test]
+    fn dynamic_slots_are_released_when_submission_finishes() {
+        let Some(host) = host() else { return };
+        let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return;
+        };
+        let cap = heap.dynamic_capacity();
+        let list1 = host.new_list().unwrap();
+        let lease1 = heap.lease_dynamic(cap - 100).unwrap();
+        list1.take_dynamic(lease1);
+        assert!(heap.lease_dynamic(200).is_none());
+
+        // Executing the list frees its dynamic slots even before the list resets.
+        list1.close();
+        host.execute(&[&list1]);
+        let lease2 = heap.lease_dynamic(200).unwrap();
+        let list2 = host.new_list().unwrap();
+        list2.take_dynamic(lease2);
+        list2.close();
+        host.execute(&[&list2]);
+
+        // Re-submitting an unreset closed list reclaims intact slots and frees them again.
+        host.execute(&[&list2]);
+        list1.reset();
+        list2.reset();
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

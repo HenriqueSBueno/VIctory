@@ -145,17 +145,16 @@ fn mirror(handle: u64) {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// The descriptor record `[tag, index, generation]` at `handle`, if it
+/// holds a view of ours.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+pub(crate) fn slot_record(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
     }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (record[0] == VIEW_TAG).then_some(record)
 }
 
 #[cfg(windows)]

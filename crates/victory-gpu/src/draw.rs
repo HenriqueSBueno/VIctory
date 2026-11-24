@@ -51,6 +51,21 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+/// One descriptor slot in a fresh dynamic table cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FreshSlot {
+    View([u32; 3]),
+    Null(Option<(ResourceType, u8)>),
+}
+
+/// Cache key for reusing a dynamic descriptor table within a command list by
+/// host heap and source descriptors (not the title's table address).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FreshKey {
+    heap: usize,
+    slots: Box<[FreshSlot]>,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -71,20 +86,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Tables made afresh in this list: (host heap, source slots) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
+    fresh_tables: std::collections::HashMap<FreshKey, u32>,
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -693,17 +697,10 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
+            let key = fresh_key(host.pool_id(), n, &entries, |k| {
+                let at = table + u64::from(k) * 32;
+                heap.index(at).and_then(|_| crate::descriptor::slot_record(at))
+            });
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -714,16 +711,18 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let first = host.dynamic(n)?;
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            let lease = host.lease_dynamic(n)?;
+            let first = lease.first();
+            list.take_dynamic(lease);
+            let mut stale = false;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let at = table + u64::from(k) * 32;
+                let view = heap.index(at).and_then(|_| crate::descriptor::view(at));
+                match view {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null_kind(index, ResourceType::Cbv, 4);
@@ -739,6 +738,9 @@ impl State {
                         }
                     }
                     None => {
+                        if matches!(key.slots[k as usize], FreshSlot::View(_)) {
+                            stale = true;
+                        }
                         if let Some(u) = used {
                             host.make_null_kind(index, u.kind, u.dwords);
                             once!(slot, "a table entry without a view");
@@ -747,6 +749,9 @@ impl State {
                         }
                     }
                 }
+            }
+            if !stale {
+                self.fresh_tables.insert(key, first);
             }
             made.push((slot, first * 32));
         }
@@ -1192,7 +1197,95 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     unsafe { list.list.OMSetBlendFactor(factor) };
 }
 
+/// Builds a cache key for a dynamic table from its host heap and source
+/// descriptor slots (ignoring the title's table address so identical transient
+/// descriptor copies within a list reuse the same dynamic table).
+fn fresh_key(
+    heap: usize,
+    n: u32,
+    entries: &[&UsedResource],
+    mut record_at: impl FnMut(u32) -> Option<[u32; 3]>,
+) -> FreshKey {
+    let slots = (0..n)
+        .map(|k| match record_at(k) {
+            Some(rec) => FreshSlot::View(rec),
+            None => {
+                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                FreshSlot::Null(used.map(|u| (u.kind, u.dwords)))
+            }
+        })
+        .collect();
+    FreshKey { heap, slots }
+}
+
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::This;
+
+    fn used(slot: u8, kind: ResourceType, offset_slots: u32, dwords: u8) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: offset_slots * 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data: 0,
+            slot,
+        }
+    }
+
+    #[test]
+    fn fresh_key_matches_identical_descriptors_across_table_addresses() {
+        let null = std::ptr::null::<std::ffi::c_void>() as This;
+        let mut heap = vec![0u64; 8 * 4]; // eight 32-byte title descriptor slots
+        let slot_addr = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
+        crate::descriptor::create_cbv(null, &[0x1000, 0, 256, 0], slot_addr(0));
+        crate::descriptor::create_srv(null, null, std::ptr::null(), slot_addr(1));
+        // Copy slots 0..2 to a different table address (slots 4..6).
+        crate::descriptor::copy_simple(null, 2, slot_addr(4), slot_addr(0), 0);
+
+        let e_cbv = used(0, ResourceType::Cbv, 0, 4);
+        let e_srv = used(0, ResourceType::Srv, 1, 8);
+        let e_null_uav = used(0, ResourceType::Uav, 2, 4);
+        let e_null_srv = used(0, ResourceType::Srv, 2, 4);
+        let entries_a = [&e_cbv, &e_srv];
+        let entries_b = [&e_cbv, &e_srv];
+        let key_a = fresh_key(1, 2, &entries_a, |k| {
+            crate::descriptor::slot_record(slot_addr(k as usize))
+        });
+        let key_b = fresh_key(1, 2, &entries_b, |k| {
+            crate::descriptor::slot_record(slot_addr(4 + k as usize))
+        });
+        assert_eq!(key_a, key_b);
+
+        // Changing a view changes the key.
+        crate::descriptor::create_cbv(null, &[0x2000, 0, 256, 0], slot_addr(4));
+        let key_changed = fresh_key(1, 2, &entries_b, |k| {
+            crate::descriptor::slot_record(slot_addr(4 + k as usize))
+        });
+        assert_ne!(key_a, key_changed);
+
+        // Missing slots distinguish expected null resource kind/dwords.
+        let key_null_uav = fresh_key(1, 3, &[&e_cbv, &e_srv, &e_null_uav], |k| {
+            crate::descriptor::slot_record(slot_addr(k as usize))
+        });
+        let key_null_srv = fresh_key(1, 3, &[&e_cbv, &e_srv, &e_null_srv], |k| {
+            crate::descriptor::slot_record(slot_addr(k as usize))
+        });
+        assert_ne!(key_null_uav, key_null_srv);
+
+        // Different host heaps never share keys.
+        let key_other_heap = fresh_key(2, 2, &entries_a, |k| {
+            crate::descriptor::slot_record(slot_addr(k as usize))
+        });
+        assert_ne!(key_a, key_other_heap);
+        heap[0] = 0;
+    }
 }
