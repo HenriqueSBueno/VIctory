@@ -303,12 +303,13 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] title_root: Option<Arc<crate::root::RootTables>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = Arc::new(make::Pending::new(shaders.clone(), graphics, title_root));
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -339,6 +340,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        crate::root::tables(desc.root),
         iid,
         out,
     )
@@ -359,6 +362,8 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        crate::root::tables(desc.root),
         iid,
         out,
     )
@@ -433,6 +438,8 @@ pub(crate) extern "system" fn create_stream(
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
+    #[cfg(windows)]
+    let mut title_root = None;
     let mut at = 0;
     while at + 8 <= desc.size {
         // SAFETY: inside the stream the title passes.
@@ -451,6 +458,12 @@ pub(crate) extern "system" fn create_stream(
             shaders.extend(copy(stage, code));
         }
         #[cfg(windows)]
+        if kind == 0 && at + size <= desc.size {
+            // SAFETY: a root-signature subobject has its `This` pointer at +8.
+            let root = unsafe { desc.stream.add(at + 8).cast::<This>().read_unaligned() };
+            title_root = crate::root::tables(root);
+        }
+        #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
             graphics.read(kind, desc.stream.add(at))
@@ -461,6 +474,8 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(windows)]
+        title_root,
         iid,
         out,
     )

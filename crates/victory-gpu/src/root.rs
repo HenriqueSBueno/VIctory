@@ -30,11 +30,11 @@ const CONSOLE_FLAGS: u32 = 0xff00_0000;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Desc {
-    parameter_count: u32,
-    parameters: *const c_void,
-    sampler_count: u32,
-    samplers: *const c_void,
-    flags: u32,
+    pub(crate) parameter_count: u32,
+    pub(crate) parameters: *const c_void,
+    pub(crate) sampler_count: u32,
+    pub(crate) samplers: *const c_void,
+    pub(crate) flags: u32,
 }
 
 /// Every version's description starts with the fields of [`Desc`].
@@ -166,11 +166,141 @@ pub extern "system" fn create_deserializer(
     unsafe { std::mem::transmute::<usize, Deserialize>(address)(blob, size, iid, out) }
 }
 
+/// Resource kind of a root descriptor table range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeKind {
+    Srv,
+    Uav,
+    Cbv,
+    Sampler,
+}
+
+/// One contiguous range inside a root descriptor table parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DescriptorRange {
+    pub(crate) kind: RangeKind,
+    /// Descriptor offset from the table's start.
+    pub(crate) offset: u32,
+    /// Number of descriptors, or `None` when unbounded (`u32::MAX`).
+    pub(crate) count: Option<u32>,
+}
+
+/// Per root parameter index: `Some(ranges)` for descriptor tables, `None` for
+/// constants and root descriptors.
+pub(crate) type RootTables = Vec<Option<Vec<DescriptorRange>>>;
+
+#[cfg(windows)]
+fn com_iid<T: windows::core::Interface>() -> Iid {
+    let iid: Iid = T::IID.to_u128().to_be_bytes();
+    guid(
+        u32::from_be_bytes(iid[0..4].try_into().unwrap()),
+        u16::from_be_bytes(iid[4..6].try_into().unwrap()),
+        u16::from_be_bytes(iid[6..8].try_into().unwrap()),
+        iid[8..16].try_into().unwrap(),
+    )
+}
+
+/// Extracts descriptor table ranges from a serialized D3D12 root signature
+/// blob using the host's CPU deserializer.
+#[cfg(windows)]
+pub(crate) fn parse_tables(blob: &[u8]) -> Option<std::sync::Arc<RootTables>> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND, D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV, D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        ID3D12RootSignatureDeserializer,
+    };
+    use windows::core::Interface;
+
+    let iid = com_iid::<ID3D12RootSignatureDeserializer>();
+    let mut out = std::ptr::null_mut();
+    let hr = create_deserializer(blob.as_ptr(), blob.len(), &iid, &mut out);
+    if hr != crate::object::S_OK || out.is_null() {
+        tracing::warn!(
+            hr,
+            size = blob.len(),
+            "root signature could not be deserialized; table ranges fall back to shader used list"
+        );
+        return None;
+    }
+    // SAFETY: `create_deserializer` returned S_OK and handed out this interface.
+    let deserializer = unsafe { ID3D12RootSignatureDeserializer::from_raw(out) };
+    // SAFETY: valid while `deserializer` lives.
+    let desc = unsafe { deserializer.GetRootSignatureDesc().as_ref() }?;
+    let params = if desc.NumParameters == 0 || desc.pParameters.is_null() {
+        &[]
+    } else {
+        // SAFETY: `desc` points to `NumParameters` root parameters.
+        unsafe { std::slice::from_raw_parts(desc.pParameters, desc.NumParameters as usize) }
+    };
+    let mut tables = Vec::with_capacity(params.len());
+    for param in params {
+        if param.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE {
+            tables.push(None);
+            continue;
+        }
+        // SAFETY: `ParameterType` is `D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE`.
+        let table = unsafe { param.Anonymous.DescriptorTable };
+        let ranges = if table.NumDescriptorRanges == 0 || table.pDescriptorRanges.is_null() {
+            &[]
+        } else {
+            // SAFETY: `table` points to `NumDescriptorRanges` ranges.
+            unsafe {
+                std::slice::from_raw_parts(
+                    table.pDescriptorRanges,
+                    table.NumDescriptorRanges as usize,
+                )
+            }
+        };
+        let mut parsed = Vec::with_capacity(ranges.len());
+        let mut next_offset = 0u32;
+        for r in ranges {
+            let offset = if r.OffsetInDescriptorsFromTableStart
+                == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+            {
+                next_offset
+            } else {
+                r.OffsetInDescriptorsFromTableStart
+            };
+            let count = (r.NumDescriptors != u32::MAX).then_some(r.NumDescriptors);
+            next_offset = match count {
+                Some(c) => offset.saturating_add(c),
+                None => u32::MAX,
+            };
+            let kind = match r.RangeType {
+                D3D12_DESCRIPTOR_RANGE_TYPE_SRV => RangeKind::Srv,
+                D3D12_DESCRIPTOR_RANGE_TYPE_UAV => RangeKind::Uav,
+                D3D12_DESCRIPTOR_RANGE_TYPE_CBV => RangeKind::Cbv,
+                D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER => RangeKind::Sampler,
+                _ => continue,
+            };
+            parsed.push(DescriptorRange {
+                kind,
+                offset,
+                count,
+            });
+        }
+        tables.push(Some(parsed));
+    }
+    Some(std::sync::Arc::new(tables))
+}
+
 #[repr(C)]
 struct RootSignature {
     object: Object,
     /// The serialized form, kept for translating pipelines later.
     blob: Vec<u8>,
+    /// Descriptor table ranges per root parameter slot, if deserialized.
+    tables: Option<std::sync::Arc<RootTables>>,
+}
+
+/// The descriptor table ranges of a title root signature, if known.
+pub(crate) fn tables(this: This) -> Option<std::sync::Arc<RootTables>> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our root signatures.
+    unsafe { &*this.cast::<RootSignature>() }.tables.clone()
 }
 
 /// Device method.
@@ -187,10 +317,15 @@ pub(crate) extern "system" fn create(
     }
     // SAFETY: the title passes `size` bytes.
     let blob = unsafe { std::slice::from_raw_parts(blob, size) }.to_vec();
-    tracing::debug!(size, "root signature");
+    #[cfg(windows)]
+    let tables = parse_tables(&blob);
+    #[cfg(not(windows))]
+    let tables = None;
+    tracing::debug!(size, tables = tables.is_some(), "root signature");
     let root = Box::new(RootSignature {
         object: Object::new(&FUNCTIONS),
         blob,
+        tables,
     });
     object::hand_out(ROOT_SIGNATURE, root, iid, &ROOT_SIGNATURE_IIDS, out)
 }
@@ -280,13 +415,7 @@ mod tests {
         let blob = blob.cast_const().cast::<Object>();
         let data = slot::<extern "system" fn(This) -> *const u8>(blob, 0x18)(blob);
         let size = slot::<extern "system" fn(This) -> usize>(blob, 0x20)(blob);
-        let iid: Iid = ID3D12RootSignatureDeserializer::IID.to_u128().to_be_bytes();
-        let iid = guid(
-            u32::from_be_bytes(iid[0..4].try_into().unwrap()),
-            u16::from_be_bytes(iid[4..6].try_into().unwrap()),
-            u16::from_be_bytes(iid[6..8].try_into().unwrap()),
-            iid[8..16].try_into().unwrap(),
-        );
+        let iid = com_iid::<ID3D12RootSignatureDeserializer>();
         let mut out = std::ptr::null_mut();
         assert_eq!(create_deserializer(data, size, &iid, &mut out), S_OK);
         // SAFETY: the host handed out this interface.

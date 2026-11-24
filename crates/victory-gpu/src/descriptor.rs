@@ -72,6 +72,18 @@ impl Heap {
         self.desc.kind == SAMPLERS
     }
 
+    /// Bytes per descriptor in this heap.
+    #[cfg(windows)]
+    pub(crate) fn step(&self) -> u32 {
+        increment(self.desc.kind).unwrap_or(0)
+    }
+
+    /// Total descriptor slots in this title heap.
+    #[cfg(windows)]
+    pub(crate) fn count(&self) -> u32 {
+        self.desc.count
+    }
+
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
@@ -146,6 +158,18 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// The descriptor record `[tag, index, generation]` at `handle`, if it
+/// holds a view of ours.
+#[cfg(windows)]
+pub(crate) fn slot_record(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (record[0] == VIEW_TAG && record[2] != 0).then_some(record)
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -384,12 +408,16 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+#[cfg(windows)]
+static FORGET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut forgot = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -402,15 +430,49 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        forgot = true;
     }
+    #[cfg(windows)]
+    if forgot {
+        FORGET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(not(windows))]
+    let _ = forgot;
 }
 
-/// The view of entry `i` if `generation` is still its own.
+/// Monotonic epoch bumped whenever any view entry is invalidated by [`forget`].
 #[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
+pub(crate) fn forget_epoch() -> u64 {
+    FORGET_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The view of entry `i` if `generation` is still its own, together with the
+/// [`forget_epoch`] observed under the `VIEWS` lock.
+#[cfg(windows)]
+pub(crate) fn view_at_epoch(i: u32, generation: u32) -> Option<(View, u64)> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    (*current == generation).then(|| {
+        (
+            view.clone(),
+            FORGET_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
+/// Batch liveness check for `(index, generation)` pairs under a single `VIEWS`
+/// lock acquisition, returning the [`forget_epoch`] observed under the lock.
+#[cfg(windows)]
+pub(crate) fn check_live(pairs: &[(u32, u32)], out: &mut Vec<bool>) -> u64 {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    out.clear();
+    out.extend(pairs.iter().map(|&(i, generation)| {
+        views
+            .list
+            .get(i as usize)
+            .is_some_and(|(_, current)| *current == generation)
+    }));
+    FORGET_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

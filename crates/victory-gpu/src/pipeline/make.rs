@@ -27,6 +27,7 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
+    title_root: Option<Arc<crate::root::RootTables>>,
     queued: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
@@ -42,7 +43,11 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        title_root: Option<Arc<crate::root::RootTables>>,
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -52,6 +57,7 @@ impl Pending {
         Pending {
             shaders,
             graphics,
+            title_root,
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -60,8 +66,13 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            HostPipeline::new(
+                &self.shaders,
+                self.graphics.as_deref(),
+                self.title_root.clone(),
+            )
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -226,7 +237,7 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(Vec::new(), None, None));
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();

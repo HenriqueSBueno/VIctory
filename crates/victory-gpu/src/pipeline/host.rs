@@ -268,6 +268,9 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
+    /// Descriptor table ranges of the title root signature this pipeline was
+    /// built with (fallback if the command list did not set a root signature).
+    pub(crate) title_root: Option<Arc<crate::root::RootTables>>,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
@@ -291,7 +294,11 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        title_root: Option<Arc<crate::root::RootTables>>,
+    ) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -447,6 +454,7 @@ impl HostPipeline {
                 mesh: false,
                 pso,
                 root,
+                title_root,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -479,6 +487,7 @@ impl HostPipeline {
                 mesh: true,
                 pso,
                 root,
+                title_root,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -549,6 +558,7 @@ impl HostPipeline {
             mesh: false,
             pso,
             root,
+            title_root,
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),
