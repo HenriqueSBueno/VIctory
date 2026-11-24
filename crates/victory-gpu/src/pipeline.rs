@@ -93,6 +93,21 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// Diagnostics: `VICTORY_DUMP_SHADERS=<dir>;<hash>,<hash>...` writes the containers of those shaders to `<dir>`
+/// (local files for `victory shader-info --disasm`; title data, never to be shared).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_container(hash: &str, container: &[u8]) {
+    let Ok(v) = std::env::var("VICTORY_DUMP_SHADERS") else { return };
+    let Some((dir, hashes)) = v.split_once(';') else { return };
+    if hashes.split(',').any(|h| !h.is_empty() && hash.starts_with(h.trim())) {
+        let path = std::path::Path::new(dir).join(format!("{hash}.cso"));
+        match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, container)) {
+            Ok(()) => tracing::warn!(%hash, path = %path.display(), "shader container dumped (diagnostics)"),
+            Err(e) => tracing::warn!(%hash, error = %e, "shader container dump failed"),
+        }
+    }
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -107,6 +122,8 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                dump_container(&self.hash, &self.container);
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(

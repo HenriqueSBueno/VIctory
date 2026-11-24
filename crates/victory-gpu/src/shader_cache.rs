@@ -106,10 +106,46 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let options = TranslateOptions { wave64 };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    #[cfg(feature = "diagnostics")]
+    if let Some(limit) = shader_loop_limit(container) {
+        tracing::debug!(limit, "shader translated with its own loop limit (diagnostics, not cached)");
+        return victory_shader::emit::with_loop_limit(limit, || translate(container));
+    }
     match CACHE.get() {
         Some(cache) => cached(cache, build(), wave64, container, translate),
         None => translate(container),
     }
+}
+
+/// Diagnostics: `VICTORY_LOOP_LIMIT_SHADERS=<hash>:<limit>,...` (hash prefixes as the logs print them) gives those
+/// shaders their own loop limit.
+#[cfg(feature = "diagnostics")]
+fn shader_loop_limit(container: &[u8]) -> Option<u32> {
+    // Entries `ps:`, `ms:`, `vs:` and `cs:` match every shader of that hardware stage.
+    let v = std::env::var("VICTORY_LOOP_LIMIT_SHADERS").ok()?;
+    let hash = blake3::hash(container).to_hex();
+    let stage = || -> Option<&'static str> {
+        use victory_shader::{Container, FourCC, HwStage};
+        let c = Container::parse(container).ok()?;
+        let programs = victory_shader::native_programs(c.part(FourCC::DXIL)?.data).ok()?;
+        programs.iter().find_map(|p| match p.stage {
+            HwStage::Ps => Some("ps"),
+            HwStage::Ms => Some("ms"),
+            HwStage::Vs => Some("vs"),
+            HwStage::Cs => Some("cs"),
+            _ => None,
+        })
+    };
+    let stage = stage();
+    v.split(',').find_map(|e| {
+        let (h, n) = e.split_once(':')?;
+        let h = h.trim();
+        let hit = match h {
+            "ps" | "ms" | "vs" | "cs" => stage == Some(h),
+            _ => !h.is_empty() && hash.starts_with(h),
+        };
+        hit.then(|| n.trim().parse().ok()).flatten()
+    })
 }
 
 /// The cache entry's converter: the build, the lowering mode and the

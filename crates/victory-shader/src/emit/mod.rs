@@ -124,6 +124,9 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// such loops are what makes a frame slow. The value is part of the
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
+    if let Some(n) = LOOP_OVERRIDE.with(std::cell::Cell::get) {
+        return n;
+    }
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         if cfg!(feature = "diagnostics") {
@@ -132,6 +135,20 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+std::thread_local! {
+    static LOOP_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) with `limit` as the loop limit on this thread: a diagnostics aid that stops the
+/// loops of chosen shaders sooner without touching the others. Callers must not cache what it makes under the
+/// default key.
+pub fn with_loop_limit<R>(limit: u32, f: impl FnOnce() -> R) -> R {
+    let old = LOOP_OVERRIDE.with(|c| c.replace(Some(limit.max(1))));
+    let r = f();
+    LOOP_OVERRIDE.with(|c| c.set(old));
+    r
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
