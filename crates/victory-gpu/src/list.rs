@@ -777,7 +777,7 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let Some((buffer, staged, bytes)) = prepare_footprint_upload(list, to, src) else {
+            let Some((buffer, staged, bytes)) = prepare_footprint_upload(&list, to, src) else {
                 return;
             };
             from = staged;
