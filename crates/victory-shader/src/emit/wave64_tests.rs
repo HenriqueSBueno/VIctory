@@ -453,6 +453,602 @@ fn translate_with_handles_synthetic_wave64_container() {
     assert_eq!(psv_wave_range(&sh_emu), (0, u32::MAX));
 }
 
+fn s_or_b32(dst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(dst, 0x10, src0, src1)
+}
+fn s_and_saveexec_b32(dst: u32, src0: u32) -> u32 {
+    sop1(dst, 0x3C, src0)
+}
+fn s_andn2_saveexec_b64(dst: u32, src0: u32) -> u32 {
+    sop1(dst, 0x27, src0)
+}
+fn v_cvt_u32_f32(dst: u32, src0: u32) -> u32 {
+    vop1(dst, 0x07, src0)
+}
+fn v_cvt_f32_ubyte0(dst: u32, src0: u32) -> u32 {
+    vop1(dst, 0x11, src0)
+}
+fn v_cvt_f32_ubyte2(dst: u32, src0: u32) -> u32 {
+    vop1(dst, 0x13, src0)
+}
+fn v_rcp_iflag_f32(dst: u32, src0: u32) -> u32 {
+    vop1(dst, 0x2B, src0)
+}
+fn v_mul_legacy_f32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
+    vop2(0x07, dst, src0, vsrc1)
+}
+fn v_lshrrev_b32(dst: u32, shift: u32, vsrc1: u32) -> u32 {
+    vop2(0x16, dst, shift, vsrc1)
+}
+fn v_fmac_f32(dst: u32, src0: u32, vsrc1: u32) -> u32 {
+    vop2(0x2B, dst, src0, vsrc1)
+}
+fn v_fma_f32(dst: u32, src0: u32, src1: u32, src2: u32, clamp: bool) -> [u32; 2] {
+    let mut w = vop3(0x14B, dst, src0, src1, src2);
+    if clamp {
+        w[0] |= 1 << 15;
+    }
+    w
+}
+fn v_cmpx_lt_u32(src0: u32, vsrc1: u32) -> u32 {
+    vopc(0xD1, src0, vsrc1)
+}
+fn v_permlane16_b32(dst: u32, vsrc0: u32, src1: u32, src2: u32) -> [u32; 2] {
+    vop3(0x377, dst, vgpr(vsrc0), src1, src2)
+}
+fn ds_write_b32(addr: u32, data0: u32) -> [u32; 2] {
+    ds_op(0x0D, 0, 0, addr, data0, 0)
+}
+fn ds_read_b32(vdst: u32, addr: u32) -> [u32; 2] {
+    ds_op(0x36, 0, 0, addr, 0, vdst)
+}
+fn buffer_load_dword(vdst: u32, vaddr: u32, srsrc: u32) -> [u32; 2] {
+    [
+        0xE030_1000,
+        vaddr | (vdst << 8) | ((srsrc >> 2) << 16) | (inline_u(0) << 24),
+    ]
+}
+
+fn validate_dxil_if_available(shader: &HostShader) {
+    #[cfg(windows)]
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut shader.dxil.clone()).unwrap();
+    }
+}
+
+fn push_branch_execz(code: &mut Vec<u32>, body: impl FnOnce(&mut Vec<u32>)) {
+    let br_idx = code.len();
+    code.push(0);
+    body(code);
+    let after = code.len();
+    code[br_idx] = s_cbranch_execz((after - (br_idx + 1)) as i16);
+}
+
+#[test]
+fn wave_uniform_readfirstlane_chain_in_divergent_branch_is_accepted() {
+    // Retail shader sequence inside a divergent `s_cbranch_execz` block:
+    // s2 = GroupId(0), s3 = s2 + 7; all VALU ops use only SGPRs, literals,
+    // inline constants, and prior uniform VGPR/readfirstlane results.
+    let mut code = vec![
+        s_add_i32(3, 2, inline_u(7)),
+        v_cmp_gt_u32(inline_u(32), 0), // 32 > v0
+        s_and_saveexec_b64(16, VCC),   // s[16:17]
+    ];
+    push_branch_execz(&mut code, |code| {
+        code.push(v_cvt_f32_ubyte0(21, 3));
+        code.push(v_rcp_iflag_f32(21, vgpr(21)));
+        code.push(v_mul_legacy_f32(21, LIT, 21));
+        code.push(0x4F7F_FFFE);
+        code.push(v_cvt_u32_f32(21, vgpr(21)));
+        code.push(v_readfirstlane_b32(7, 21));
+
+        code.push(v_cvt_f32_ubyte2(26, 7));
+        code.push(v_mul_legacy_f32(27, LIT, 26));
+        code.push(0x3B80_8081);
+        code.extend_from_slice(&v_fma_f32(26, vgpr(26), 2, LIT, true));
+        code.push(0x3EFA_E148);
+        code.push(v_readfirstlane_b32(67, 27));
+        code.push(v_readfirstlane_b32(68, 26));
+
+        code.push(v_cvt_f32_ubyte2(30, 7));
+        code.push(v_mul_legacy_f32(30, LIT, 30));
+        code.push(0x3B80_8081);
+        code.push(v_readfirstlane_b32(46, 30));
+
+        code.push(s_add_i32(67, 67, 68));
+        code.push(s_add_i32(67, 67, 46));
+        code.push(v_mov_b32(1, 67));
+        emit_uav_store(code, 1, 0);
+    });
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    code.push(S_ENDPGM);
+
+    for threads in [[128, 1, 1], [32, 1, 1]] {
+        let prog = make_cs_program(&code, threads, 0, true);
+        for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            let shader = emit_cs(&prog, mode).unwrap_or_else(|e| {
+                panic!("expected uniform readfirstlane chain to succeed ({threads:?}, {mode:?}): {e:?}")
+            });
+            validate_dxil_if_available(&shader);
+            assert_eq!(
+                sfi0_flags(&shader) & 0x4000,
+                0,
+                "uniform readfirstlane should not set WAVE_OPS in {mode:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn wave_uniform_valu_ops_loops_and_readlane_any_lane_in_divergent_branch_are_accepted() {
+    // Exercises uniform shifts/logic/add/cndmask (with uniform v_cmp), a
+    // uniform diamond + uniform loop inside `s_cbranch_execz`, and
+    // `v_readlane_b32` with constant >= 32, SGPR lane, and varying VGPR lane.
+    let mut code = vec![
+        s_add_i32(3, 2, inline_u(5)),
+        v_cmp_gt_u32(inline_u(32), 0), // 32 > v0
+        s_and_saveexec_b64(16, VCC),
+    ];
+    push_branch_execz(&mut code, |code| {
+        code.push(v_mov_b32(21, 3));
+        code.push(v_lshrrev_b32(21, inline_u(1), 21));
+        code.push(v_lshlrev_b32(21, inline_u(3), 21));
+        code.push(v_and_b32(21, inline_u(63), 21));
+        code.push(v_or_b32(21, inline_u(4), 21));
+        code.push(v_add_nc_u32(21, 2, 21));
+
+        // Uniform compare -> uniform v_cndmask_b32.
+        code.push(v_cmp_eq_u32(inline_u(12), 21));
+        code.extend_from_slice(&v_cndmask_b32(22, vgpr(21), inline_u(9), VCC));
+
+        // Uniform diamond inside the divergent region.
+        code.push(s_cmp_lt_u32(3, inline_u(10)));
+        let br_diam = code.len();
+        code.push(0);
+        code.push(v_add_nc_u32(22, inline_u(1), 22));
+        let diam_join = code.len();
+        code[br_diam] = s_cbranch_scc1((diam_join - (br_diam + 1)) as i16);
+
+        // Uniform loop inside the divergent region.
+        code.push(s_mov_b32(20, inline_u(0)));
+        let loop_hdr = code.len();
+        code.push(v_add_nc_u32(22, 20, 22));
+        code.push(s_add_i32(20, 20, inline_u(1)));
+        code.push(s_cmp_lt_u32(20, inline_u(3)));
+        let back_off = (loop_hdr as isize) - ((code.len() + 1) as isize);
+        code.push(s_cbranch_scc1(back_off as i16));
+
+        // Read the uniform VGPR using constant >= 32, SGPR lane, and varying `v0`.
+        code.extend_from_slice(&v_readlane_b32(21, 22, inline_u(40)));
+        code.extend_from_slice(&v_readlane_b32(22, 22, 2));
+        code.extend_from_slice(&v_readlane_b32(23, 22, vgpr(0)));
+        code.push(s_add_i32(21, 21, 22));
+        code.push(s_add_i32(21, 21, 23));
+        code.push(v_mov_b32(1, 21));
+        emit_uav_store(code, 1, 0);
+    });
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    code.push(S_ENDPGM);
+
+    for threads in [[128, 1, 1], [32, 1, 1]] {
+        let prog = make_cs_program(&code, threads, 0, true);
+        for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+            let shader = emit_cs(&prog, mode).unwrap_or_else(|e| {
+                panic!("expected uniform ops/loop/readlane to succeed ({threads:?}, {mode:?}): {e:?}")
+            });
+            validate_dxil_if_available(&shader);
+            assert_eq!(sfi0_flags(&shader) & 0x4000, 0);
+        }
+    }
+}
+
+#[test]
+fn wave_uniform_readfirstlane_and_readlane_in_divergent_ps_are_accepted() {
+    use super::container::SigElement;
+    use crate::native::PsInput;
+
+    // Compute uniform s2 = 7, narrow EXEC by v0 < 0.5 (barycentric), run both reads inside branch.
+    let mut code = vec![
+        s_mov_b32(2, inline_u(7)),
+        v_cmp_gt_u32(inline_u(10), 0),
+        s_and_saveexec_b32(3, VCC),
+    ];
+    push_branch_execz(&mut code, |code| {
+        code.push(v_mov_b32(1, 2));
+        code.push(v_add_nc_u32(1, inline_u(3), 1));
+        code.push(v_readfirstlane_b32(4, 1));
+        code.extend_from_slice(&v_readlane_b32(5, 1, inline_u(0)));
+        code.push(s_add_i32(4, 4, 5));
+        code.push(v_mov_b32(2, 4));
+        code.extend_from_slice(&[0xF800_180F, 0x0202_0202]); // exp mrt0 v2, v2, v2, v2 done vm
+    });
+    code.push(s_or_b32(EXEC_LO, EXEC_LO, 3));
+    code.extend_from_slice(&[0xF800_180F, 0x0000_0000]); // exp mrt0 v0, v0, v0, v0 done vm
+    code.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: crate::native::Usage::Generic,
+                row: 0,
+                mask: 0b1111,
+                attr: 0,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            }],
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let dxbc = empty_dxbc();
+    let container = Container::parse(&dxbc).unwrap();
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage).unwrap();
+    let io_res = io::raise(&p, &native).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let out_sig = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    let lowered = super::lower::lower(&super::lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io_res,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![out_sig],
+        prims: vec![],
+        mesh_stride: 0,
+        options: TranslateOptions::default(),
+    })
+    .unwrap();
+    let _ = container;
+    #[cfg(windows)]
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut lowered.dxil.clone()).unwrap();
+    }
+}
+
+fn assert_refused_divergent(words: &[u32], lds_bytes: u32, expect_msg: Option<&str>, label: &str) {
+    let prog = make_cs_program(words, [128, 1, 1], lds_bytes, true);
+    for mode in [Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        let err = emit_cs(&prog, mode).expect_err(&format!(
+            "expected refusal for {label} in {mode:?}"
+        ));
+        match err {
+            ShaderError::Unsupported { what, .. } => {
+                if let Some(msg) = expect_msg {
+                    assert!(
+                        what.contains(msg),
+                        "for {label} ({mode:?}) expected '{msg}', got '{what}'"
+                    );
+                }
+            }
+            other => panic!("expected Unsupported for {label} in {mode:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn divergent_non_uniform_readfirstlane_cases_are_refused() {
+    let wrap_div = |build: &dyn Fn(&mut Vec<u32>)| -> Vec<u32> {
+        let mut code = Vec::new();
+        code.push(s_add_i32(3, 2, inline_u(1)));
+        build(&mut code);
+        code.push(S_ENDPGM);
+        code
+    };
+    let inside_div = |setup: &dyn Fn(&mut Vec<u32>),
+                      body: &dyn Fn(&mut Vec<u32>),
+                      v_read: u32|
+     -> Vec<u32> {
+        wrap_div(&|code| {
+            setup(code);
+            code.push(v_cmp_gt_u32(inline_u(32), 0));
+            code.push(s_and_saveexec_b64(16, VCC));
+            push_branch_execz(code, |code| {
+                body(code);
+                code.push(v_readfirstlane_b32(7, v_read));
+                code.push(v_mov_b32(1, 7));
+                emit_uav_store(code, 1, 0);
+            });
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+        })
+    };
+
+    // 1. Thread id (v0)
+    assert_refused_divergent(
+        &inside_div(&|_| {}, &|_| {}, 0),
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "thread id v0",
+    );
+
+    // 2. v_mbcnt computed before divergent branch
+    assert_refused_divergent(
+        &inside_div(
+            &|code| {
+                code.extend_from_slice(&v_mbcnt_lo_u32_b32(21, NEG_ONE, inline_u(0)));
+            },
+            &|_| {},
+            21,
+        ),
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "v_mbcnt",
+    );
+
+    // 3. VMEM buffer_load_dword even at constant offset
+    assert_refused_divergent(
+        &inside_div(
+            &|_| {},
+            &|code| {
+                code.push(s_mov_b32(1, inline_u(0)));
+                code.extend_from_slice(&s_load_dwordx4(8, 0));
+                code.push(v_mov_b32(22, inline_u(0)));
+                code.extend_from_slice(&buffer_load_dword(21, 22, 8));
+            },
+            21,
+        ),
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "buffer_load_dword",
+    );
+
+    // 4. LDS ds_read_b32 even at constant address 0
+    assert_refused_divergent(
+        &inside_div(
+            &|_| {},
+            &|code| {
+                code.push(v_mov_b32(22, inline_u(0)));
+                code.push(v_mov_b32(23, 3));
+                code.extend_from_slice(&ds_write_b32(22, 23));
+                code.extend_from_slice(&ds_read_b32(21, 22));
+            },
+            21,
+        ),
+        256,
+        Some("v_readfirstlane in divergent control flow"),
+        "ds_read_b32",
+    );
+
+    // 5. DPP (before branch, read inside branch)
+    assert_refused_divergent(
+        &inside_div(
+            &|code| {
+                code.push(v_mov_b32(21, vgpr(0)));
+                code.extend_from_slice(&dpp_row_shr(0x25, 21, 21, 21, 0x111, 0xF));
+            },
+            &|_| {},
+            21,
+        ),
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "dpp",
+    );
+
+    // 6. v_permlane16_b32
+    assert_refused_divergent(
+        &inside_div(
+            &|code| {
+                code.push(v_mov_b32(22, inline_u(1)));
+                code.extend_from_slice(&v_permlane16_b32(21, 22, inline_u(0), inline_u(0)));
+            },
+            &|_| {},
+            21,
+        ),
+        0,
+        None,
+        "v_permlane16_b32",
+    );
+
+    // 7. v_cndmask_b32 with a non-uniform mask
+    assert_refused_divergent(
+        &inside_div(
+            &|_| {},
+            &|code| {
+                code.push(v_cmp_gt_u32(inline_u(10), 0));
+                code.extend_from_slice(&v_cndmask_b32(21, inline_u(1), 3, VCC));
+            },
+            21,
+        ),
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "v_cndmask non-uniform mask",
+    );
+
+    // 8. Partial-write v_fmac_f32 preserving non-uniform old dst
+    assert_refused_divergent(
+        &inside_div(
+            &|code| {
+                code.push(v_mov_b32(21, vgpr(0)));
+            },
+            &|code| {
+                code.push(v_fmac_f32(21, inline_u(1), 2));
+            },
+            21,
+        ),
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "partial write v_fmac_f32",
+    );
+}
+
+#[test]
+fn divergent_narrower_exec_readfirstlane_and_readlane_are_refused() {
+    // 1. VGPR conditionally written inside an inner `s_cbranch_execz`, then merged at outer level.
+    let mut phi_narrow = vec![
+        s_add_i32(3, 2, inline_u(1)),
+        v_mov_b32(21, inline_u(0)),
+        v_cmp_gt_u32(inline_u(32), 0),
+        s_and_saveexec_b64(16, VCC),
+    ];
+    push_branch_execz(&mut phi_narrow, |code| {
+        code.push(v_mov_b32(21, 3));
+    });
+    phi_narrow.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    // Now inside another outer divergent branch, read v21 (whose Phi merged divergent lanes).
+    phi_narrow.push(v_cmp_gt_u32(inline_u(48), 0));
+    phi_narrow.push(s_and_saveexec_b64(18, VCC));
+    push_branch_execz(&mut phi_narrow, |code| {
+        code.push(v_readfirstlane_b32(7, 21));
+        code.push(v_mov_b32(1, 7));
+        emit_uav_store(code, 1, 0);
+    });
+    phi_narrow.push(s_or_b64(EXEC_LO, EXEC_LO, 18));
+    phi_narrow.push(S_ENDPGM);
+    assert_refused_divergent(
+        &phi_narrow,
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "narrower exec phi",
+    );
+
+    // 2. Inside `s_cbranch_execz`, inner `s_and_saveexec` narrows EXEC for `v21`, then `s_or_b64` widens before read.
+    let mut widen_same_block = vec![
+        s_add_i32(3, 2, inline_u(1)),
+        v_cmp_gt_u32(inline_u(48), 0),
+        s_and_saveexec_b64(16, VCC),
+    ];
+    push_branch_execz(&mut widen_same_block, |code| {
+        code.push(v_mov_b32(21, inline_u(0)));
+        code.push(v_cmp_gt_u32(inline_u(16), 0));
+        code.push(s_and_saveexec_b64(18, VCC));
+        code.push(v_mov_b32(21, 3));
+        code.push(s_or_b64(EXEC_LO, EXEC_LO, 18));
+        code.push(v_readfirstlane_b32(7, 21));
+        code.push(v_mov_b32(1, 7));
+        emit_uav_store(code, 1, 0);
+    });
+    widen_same_block.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    widen_same_block.push(S_ENDPGM);
+    assert_refused_divergent(
+        &widen_same_block,
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "narrowed then widened via s_or_b64",
+    );
+
+    // 3. `v_cmpx_lt_u32` + `v_mov` + `s_or_b64` without branching.
+    let mut cmpx_widen = vec![
+        s_add_i32(3, 2, inline_u(1)),
+        v_cmp_gt_u32(inline_u(48), 0),
+        s_and_saveexec_b64(16, VCC),
+    ];
+    push_branch_execz(&mut cmpx_widen, |code| {
+        code.push(v_mov_b32(21, inline_u(0)));
+        code.push(s_mov_b64(18, EXEC_LO));
+        code.push(v_cmpx_lt_u32(inline_u(8), 0));
+        code.push(v_mov_b32(21, 3));
+        code.push(s_or_b64(EXEC_LO, EXEC_LO, 18));
+        code.push(v_readfirstlane_b32(7, 21));
+        code.push(v_mov_b32(1, 7));
+        emit_uav_store(code, 1, 0);
+    });
+    cmpx_widen.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    cmpx_widen.push(S_ENDPGM);
+    assert_refused_divergent(
+        &cmpx_widen,
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "v_cmpx narrowed then widened",
+    );
+
+    // 4. `s_andn2_saveexec_b64` else-flip moves to disjoint lanes after writing `v21`.
+    let mut else_flip = vec![
+        s_add_i32(3, 2, inline_u(1)),
+        v_cmp_gt_u32(inline_u(48), 0),
+        s_and_saveexec_b64(16, VCC),
+    ];
+    push_branch_execz(&mut else_flip, |code| {
+        code.push(v_mov_b32(21, inline_u(0)));
+        code.push(v_cmp_gt_u32(inline_u(16), 0));
+        code.push(s_and_saveexec_b64(18, VCC));
+        code.push(v_mov_b32(21, 3));
+        code.push(s_andn2_saveexec_b64(18, 18));
+        code.push(v_readfirstlane_b32(7, 21));
+        code.push(s_or_b64(EXEC_LO, EXEC_LO, 18));
+        code.push(v_mov_b32(1, 7));
+        emit_uav_store(code, 1, 0);
+    });
+    else_flip.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    else_flip.push(S_ENDPGM);
+    assert_refused_divergent(
+        &else_flip,
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "s_andn2_saveexec flip",
+    );
+
+    // 5. `v_readlane_b32` of non-uniform VGPR (`v0`) inside `s_cbranch_execz`.
+    let mut readlane_non_uni = vec![v_cmp_gt_u32(inline_u(32), 0), s_and_saveexec_b64(16, VCC)];
+    push_branch_execz(&mut readlane_non_uni, |code| {
+        code.extend_from_slice(&v_readlane_b32(7, 0, inline_u(0)));
+        code.push(v_mov_b32(1, 7));
+        emit_uav_store(code, 1, 0);
+    });
+    readlane_non_uni.push(s_or_b64(EXEC_LO, EXEC_LO, 16));
+    readlane_non_uni.push(S_ENDPGM);
+    assert_refused_divergent(
+        &readlane_non_uni,
+        0,
+        Some("a cross-lane read in divergent control flow"),
+        "v_readlane non-uniform v0",
+    );
+
+    // 6. `v_readfirstlane_b32` of value produced by a divergent loop Phi.
+    let mut div_loop = vec![
+        s_add_i32(3, 2, inline_u(1)),
+        v_mov_b32(21, inline_u(0)),
+        s_mov_b64(18, EXEC_LO),
+    ];
+    let hdr = div_loop.len();
+    div_loop.push(v_add_nc_u32(21, inline_u(1), 21));
+    div_loop.push(v_readfirstlane_b32(7, 21));
+    div_loop.push(v_cmp_lt_u32(vgpr(0), 21)); // per-lane condition!
+    div_loop.push(sop1(16, 0x24, VCC)); // s_and_saveexec_b64 s[16:17], vcc
+    let br_exit = div_loop.len();
+    div_loop.push(0); // s_cbranch_execz exit
+    div_loop.push(sopp(
+        0x02,
+        ((hdr as isize) - ((div_loop.len() + 1) as isize)) as i16,
+    )); // s_branch hdr
+    let after_loop = div_loop.len();
+    div_loop[br_exit] = s_cbranch_execz((after_loop - (br_exit + 1)) as i16);
+    div_loop.push(s_or_b64(EXEC_LO, EXEC_LO, 18));
+    div_loop.push(v_mov_b32(1, 7));
+    emit_uav_store(&mut div_loop, 1, 0);
+    div_loop.push(S_ENDPGM);
+    assert_refused_divergent(
+        &div_loop,
+        0,
+        Some("v_readfirstlane in divergent control flow"),
+        "divergent loop phi",
+    );
+}
+
 #[cfg(windows)]
 mod gpu {
     use std::sync::{Mutex, OnceLock};

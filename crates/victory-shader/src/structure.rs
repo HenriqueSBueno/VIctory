@@ -226,6 +226,28 @@ impl Bools {
         self.and(a, nb) == Bool::FALSE
     }
 
+    /// Whether `a` implies `b` (`a & !b == false`) without allocating nodes.
+    pub(crate) fn implies_ro(&self, a: Bool, b: Bool) -> bool {
+        fn check(bools: &Bools, a: Bool, b: Bool, memo: &mut Map<(Bool, Bool), bool>) -> bool {
+            if a == Bool::FALSE || b == Bool::TRUE || a == b {
+                return true;
+            }
+            if a == Bool::TRUE || b == Bool::FALSE {
+                return false;
+            }
+            if let Some(&r) = memo.get(&(a, b)) {
+                return r;
+            }
+            let top = |x: Bool| bools.nodes[x.0 as usize].0;
+            let v = top(a).min(top(b));
+            let ((a0, a1), (b0, b1)) = (bools.split(a, v), bools.split(b, v));
+            let r = check(bools, a0, b0, memo) && check(bools, a1, b1, memo);
+            memo.insert((a, b), r);
+            r
+        }
+        check(self, a, b, &mut Map::default())
+    }
+
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
     fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
@@ -314,17 +336,23 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block: `EXEC` on entry before the block's instructions.
+    pub(crate) entry_exec: Vec<Bool>,
+    /// Per block: `EXEC` at the end of the block.
+    pub(crate) exit_exec: Vec<Bool>,
+    /// Per block and instruction: `EXEC` where read (`None` if not read).
+    pub(crate) execs: Vec<Vec<Option<Bool>>>,
 }
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
     loop {
-        let execs = l.masks_in_order();
+        let (execs, entry_exec, exit_exec) = l.masks_in_order();
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
-            return l.finish(&execs, &cond);
+            return l.finish(execs, entry_exec, exit_exec, cond);
         }
         l.unresolved.extend(wrong);
         l.reset();
@@ -442,8 +470,9 @@ impl<'a> Lanes<'a> {
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
-    /// block in reverse postorder; returns EXEC at each instruction reading it.
-    fn masks_in_order(&mut self) -> Vec<Vec<Option<Bool>>> {
+    /// block in reverse postorder; returns EXEC at each instruction reading it,
+    /// plus entry and exit EXEC per block.
+    fn masks_in_order(&mut self) -> (Vec<Vec<Option<Bool>>>, Vec<Bool>, Vec<Bool>) {
         let p = self.p;
         let input = |reg| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
         if let Some(lo) = input(Reg::S(EXEC)) {
@@ -457,6 +486,8 @@ impl<'a> Lanes<'a> {
         }
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
+        let mut entry_exec = vec![Bool::TRUE; p.blocks.len()];
+        let mut exit_exec = vec![Bool::TRUE; p.blocks.len()];
         for n in 0..self.order.len() {
             let b = self.order[n];
             let mut c = if n == 0 { Bool::TRUE } else { Bool::FALSE };
@@ -474,6 +505,20 @@ impl<'a> Lanes<'a> {
                     self.active.insert(phi.value);
                 }
             }
+            let entry = if n == 0 {
+                Bool::TRUE
+            } else if let Some(k) =
+                self.key(|r| p.blocks[b].phis.iter().find(|p| p.reg == r).map(|p| p.value), EXEC)
+            {
+                self.mask(k).0
+            } else {
+                self.incoming[b]
+                    .iter()
+                    .find_map(|&(q, _)| (self.index[q] < n).then(|| exit_exec[q]))
+                    .unwrap_or(Bool::TRUE)
+            };
+            entry_exec[b] = entry;
+            let mut block_exec = entry;
             // EXEC where known in this block (read or written so far).
             let mut now = None;
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
@@ -481,19 +526,24 @@ impl<'a> Lanes<'a> {
                     let e = self.exec(inst);
                     execs[b][i] = Some(e);
                     now = Some(e);
+                    block_exec = e;
                 }
                 self.step(inst, now);
                 if let Some(k) = self.key(|r| inst.write(r), EXEC) {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
+                    if let Some(e) = now {
+                        block_exec = e;
+                    }
                 }
             }
+            exit_exec[b] = block_exec;
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
                 self.when[b] = Some(self.branch(last));
             }
         }
-        execs
+        (execs, entry_exec, exit_exec)
     }
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
@@ -534,8 +584,10 @@ impl<'a> Lanes<'a> {
 
     fn finish(
         mut self,
-        execs: &[Vec<Option<Bool>>],
-        cond: &[Bool],
+        execs: Vec<Vec<Option<Bool>>>,
+        entry_exec: Vec<Bool>,
+        exit_exec: Vec<Bool>,
+        cond: Vec<Bool>,
     ) -> Result<Structured, ShaderError> {
         let blocks = &self.p.blocks;
         let b = &mut self.b;
@@ -584,6 +636,9 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             active: self.active,
+            entry_exec,
+            exit_exec,
+            execs,
             bools: self.b,
             exits,
             guards,

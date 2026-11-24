@@ -13,7 +13,7 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use super::{TranslateOptions, UserData, Wave64Mode};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Fields, NULL, Operand, Valu};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -233,8 +233,9 @@ struct Lower<'a> {
     spills: HashMap<(usize, usize), Moved>,
     /// Per IR block: whether all threads in the thread group arrive together.
     uniform: Vec<bool>,
-    /// Per IR value: conservatively true only for group-uniform scalars.
-    val_uniform: Vec<bool>,
+    /// `(b, i)` sites of `v_readfirstlane_b32` / `v_readlane_b32` reading a
+    /// provably wave-uniform value (lowered directly to that value).
+    uniform_lane_reads: HashSet<(usize, usize)>,
     /// Entry-block `(flat_tid, console_lane, vwave)` cached when emulating Wave64.
     wave_ids: Option<(V, V, V)>,
     /// Active `begin_guarded` nesting depth (never emit barriers while > 0).
@@ -801,6 +802,881 @@ fn compute_uniformity(
     (blocks, val_uniform)
 }
 
+fn writes_non_narrowing_exec(inst: &Inst) -> bool {
+    if inst.write(Reg::S(EXEC)).is_none() && inst.write(Reg::S(EXEC + 1)).is_none() {
+        return false;
+    }
+    let name = inst.name();
+    if name.starts_with("v_cmpx_") {
+        return false;
+    }
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return true;
+    };
+    let is_exec =
+        |op: Option<&Operand>| matches!(op, Some(&Operand::Scalar { code, .. }) if code == EXEC);
+    !match name {
+        "s_and_saveexec_b32"
+        | "s_and_saveexec_b64"
+        | "s_andn1_saveexec_b32"
+        | "s_andn1_saveexec_b64" => true,
+        "s_and_b32" | "s_and_b64" => is_exec(src.first()) || is_exec(src.get(1)),
+        "s_andn2_b32" | "s_andn2_b64" => is_exec(src.first()),
+        "s_andn1_b32" | "s_andn1_b64" => is_exec(src.get(1)),
+        _ => false,
+    }
+}
+
+fn preserves_valu_dst(name: &str, v: &Valu) -> bool {
+    matches!(
+        name,
+        "v_fmac_f32"
+            | "v_mac_f32"
+            | "v_mac_legacy_f32"
+            | "v_fmac_f16"
+            | "v_mac_f16"
+            | "v_fma_mixlo_f16"
+            | "v_fma_mixhi_f16"
+    ) || v.sdwa.is_some_and(|sd| sd.dst_sel < 6 && sd.dst_unused == 2)
+        || (v.sdwa.is_none()
+            && (name == "v_cvt_f16_f32"
+                || name.ends_with("_f16")
+                || name.ends_with("_u16")
+                || name.ends_with("_i16")
+                || name.ends_with("_b16"))
+            && !matches!(
+                name,
+                "v_cvt_f32_f16" | "v_pack_b32_f16" | "v_cvt_pkrtz_f16_f32"
+            )
+            && !name.starts_with("v_pk_"))
+}
+
+/// Finds `v_readfirstlane_b32` and `v_readlane_b32` instructions whose source
+/// value is provably wave-uniform (identical across all active lanes at the read).
+fn compute_wave_uniformity(
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+    io_inputs: &[(Value, Input)],
+    spills: &HashMap<(usize, usize), Moved>,
+) -> HashSet<(usize, usize)> {
+    let n = p.blocks.len();
+    if n == 0 {
+        return HashSet::new();
+    }
+    let max_v = p
+        .inputs
+        .iter()
+        .map(|i| i.1.0)
+        .chain(p.blocks.iter().flat_map(|b| {
+            b.phis.iter().map(|phi| phi.value.0).chain(
+                b.insts
+                    .iter()
+                    .flat_map(|inst| inst.writes.iter().map(|w| w.1.0)),
+            )
+        }))
+        .max()
+        .map_or(0, |m| m as usize + 1);
+
+    let mut def_of: Vec<Option<(usize, Option<usize>)>> = vec![None; max_v];
+    for (b, blk) in p.blocks.iter().enumerate() {
+        for phi in &blk.phis {
+            def_of[phi.value.0 as usize] = Some((b, None));
+        }
+        for (ii, inst) in blk.insts.iter().enumerate() {
+            for &(_, w) in &inst.writes {
+                def_of[w.0 as usize] = Some((b, Some(ii)));
+            }
+        }
+    }
+
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut fwd = vec![false; n];
+    let mut rpo = vec![usize::MAX; n];
+    for (idx, &b) in order.iter().enumerate() {
+        fwd[b] = true;
+        rpo[b] = idx;
+    }
+    let mut succs = vec![Vec::new(); n];
+    let mut rev_preds = vec![Vec::new(); n];
+    for &b in &order {
+        match st.exits[b] {
+            LaneExit::Jump(t) if t < n => succs[b].push(t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                if taken < n {
+                    succs[b].push(taken);
+                }
+                if not_taken != taken && not_taken < n {
+                    succs[b].push(not_taken);
+                }
+            }
+            LaneExit::End => succs[b].push(n),
+            _ => {}
+        }
+        for &s in &succs[b] {
+            if s < n {
+                rev_preds[s].push(b);
+            }
+        }
+    }
+
+    let (_rev_idx, ipdom) = compute_postdoms(n, &succs, &fwd);
+    let mut natural_loops: Vec<(usize, Vec<bool>)> = Vec::new();
+    for &h in &order {
+        let back_preds: Vec<usize> = rev_preds[h]
+            .iter()
+            .copied()
+            .filter(|&q| rpo[h] <= rpo[q])
+            .collect();
+        if back_preds.is_empty() {
+            continue;
+        }
+        let mut in_loop = vec![false; n];
+        in_loop[h] = true;
+        let mut stack = Vec::new();
+        for q in back_preds {
+            if !in_loop[q] {
+                in_loop[q] = true;
+                stack.push(q);
+            }
+        }
+        while let Some(x) = stack.pop() {
+            for &pb in &rev_preds[x] {
+                if !in_loop[pb] {
+                    in_loop[pb] = true;
+                    stack.push(pb);
+                }
+            }
+        }
+        natural_loops.push((h, in_loop));
+    }
+
+    let non_narrowing_exec: Vec<Vec<bool>> = p
+        .blocks
+        .iter()
+        .map(|blk| blk.insts.iter().map(writes_non_narrowing_exec).collect())
+        .collect();
+    let block_has_non_narrowing: Vec<bool> = non_narrowing_exec
+        .iter()
+        .map(|v| v.iter().any(|&w| w))
+        .collect();
+
+    let mask_set: HashSet<Value> = st
+        .masks
+        .keys()
+        .copied()
+        .chain(st.highs.keys().copied())
+        .collect();
+    let io_map: HashMap<Value, Input> = io_inputs.iter().copied().collect();
+    let param_set: HashSet<Value> = res.params.iter().map(|&(v, _, _)| v).collect();
+
+    let mut wave_val = vec![false; max_v];
+    let mut mask_uniform = vec![false; max_v];
+    for &b in &order {
+        for phi in &p.blocks[b].phis {
+            let idx = phi.value.0 as usize;
+            if !mask_set.contains(&phi.value) {
+                wave_val[idx] = true;
+            } else if st.masks.contains_key(&phi.value)
+                && !matches!(phi.reg, Reg::S(r) if r == EXEC || r == EXEC + 1)
+            {
+                mask_uniform[idx] = true;
+            }
+        }
+        for inst in &p.blocks[b].insts {
+            for &(_, w) in &inst.writes {
+                let idx = w.0 as usize;
+                if !mask_set.contains(&w) {
+                    wave_val[idx] = true;
+                } else if st.masks.contains_key(&w) {
+                    mask_uniform[idx] = true;
+                }
+            }
+        }
+    }
+    for &(_, v) in &p.inputs {
+        let idx = v.0 as usize;
+        if idx < max_v {
+            wave_val[idx] = !mask_set.contains(&v)
+                && (param_set.contains(&v)
+                    || matches!(
+                        io_map.get(&v),
+                        Some(Input::GroupId(_) | Input::MeshGroup | Input::GroupInfo)
+                    ));
+        }
+    }
+
+    let lo_mask = |v: Value| st.highs.get(&v).copied().unwrap_or(v);
+    let mask_bdd_is_uniform = |m: Bool, wave_val: &[bool]| -> bool {
+        st.bools.support(m).iter().all(|a| match *a {
+            Atom::Uniform(v) => wave_val[v.0 as usize],
+            _ => false,
+        })
+    };
+
+    let no_non_narrowing_exec_write = |def_b: usize,
+                                       def_ii: Option<usize>,
+                                       target_b: usize,
+                                       target_end_ii: Option<usize>|
+     -> bool {
+        if def_b == target_b {
+            let start = def_ii.map_or(0, |ii| ii + 1);
+            let end = target_end_ii.unwrap_or(p.blocks[def_b].insts.len());
+            if start <= end {
+                return !(start..end).any(|k| non_narrowing_exec[def_b][k]);
+            }
+        }
+        let start = def_ii.map_or(0, |ii| ii + 1);
+        if (start..p.blocks[def_b].insts.len()).any(|k| non_narrowing_exec[def_b][k]) {
+            return false;
+        }
+        let mut reach_to = vec![false; n];
+        reach_to[target_b] = true;
+        let mut stack = vec![target_b];
+        while let Some(x) = stack.pop() {
+            if x == def_b {
+                continue;
+            }
+            for &pb in &rev_preds[x] {
+                if !reach_to[pb] {
+                    reach_to[pb] = true;
+                    stack.push(pb);
+                }
+            }
+        }
+        let cyclic_target = succs[target_b]
+            .iter()
+            .any(|&s| s < n && reach_to[s] && s != def_b);
+        let target_limit = if cyclic_target {
+            p.blocks[target_b].insts.len()
+        } else {
+            target_end_ii.unwrap_or(p.blocks[target_b].insts.len())
+        };
+        if (0..target_limit).any(|k| non_narrowing_exec[target_b][k]) {
+            return false;
+        }
+        let mut visited = vec![false; n];
+        for &s in &succs[def_b] {
+            if s < n && s != def_b && reach_to[s] && !visited[s] {
+                visited[s] = true;
+                stack.push(s);
+            }
+        }
+        while let Some(x) = stack.pop() {
+            if x != target_b && block_has_non_narrowing[x] {
+                return false;
+            }
+            for &s in &succs[x] {
+                if s < n && s != def_b && reach_to[s] && !visited[s] {
+                    visited[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        true
+    };
+
+    let exec_reaches = |def_val: Value,
+                        use_b: usize,
+                        use_ii: Option<usize>,
+                        use_pred: Option<usize>,
+                        use_exec: Bool,
+                        in_div_region: &[bool]|
+     -> bool {
+        let Some((def_b, def_ii)) = def_of[def_val.0 as usize] else {
+            return true;
+        };
+        if !fwd[def_b] {
+            return false;
+        }
+        let def_exec = match def_ii {
+            Some(ii) => match st.execs[def_b][ii] {
+                Some(e) => e,
+                None => return true,
+            },
+            None => st.entry_exec[def_b],
+        };
+        if def_exec == Bool::FALSE || use_exec == Bool::FALSE {
+            return false;
+        }
+        if def_exec == Bool::TRUE && !in_div_region[def_b] {
+            return true;
+        }
+        if use_exec != Bool::TRUE && st.bools.implies_ro(use_exec, def_exec) {
+            return true;
+        }
+        let (target_b, target_end_ii) = match (use_ii, use_pred) {
+            (Some(ii), _) => (use_b, Some(ii)),
+            (None, Some(q)) => (q, None),
+            _ => (use_b, None),
+        };
+        no_non_narrowing_exec_write(def_b, def_ii, target_b, target_end_ii)
+    };
+
+    let mut branch_uniform = vec![false; n];
+    let mut div_merge = vec![false; n];
+    let mut in_div_region = vec![false; n];
+
+    loop {
+        let mut changed = false;
+        let mut next_branch = vec![false; n];
+        for &b in &order {
+            if let LaneExit::Branch { when, .. } = st.exits[b] {
+                next_branch[b] = st.bools.support(when).iter().all(|a| match *a {
+                    Atom::Uniform(v) => wave_val[v.0 as usize],
+                    Atom::Lane(v) => {
+                        let lo = lo_mask(v);
+                        st.masks.contains_key(&lo)
+                            && mask_uniform[lo.0 as usize]
+                            && !in_div_region[b]
+                            && def_of[lo.0 as usize].is_some_and(|(db, di)| {
+                                di.is_some_and(|ii| st.guards[db][ii].is_none())
+                                    && exec_reaches(
+                                        lo,
+                                        b,
+                                        p.blocks[b].insts.len().checked_sub(1),
+                                        None,
+                                        st.exit_exec[b],
+                                        &in_div_region,
+                                    )
+                            })
+                    }
+                    _ => false,
+                });
+            }
+        }
+        if next_branch != branch_uniform {
+            branch_uniform = next_branch;
+            changed = true;
+        }
+        div_merge.fill(false);
+        in_div_region.fill(false);
+        for &u in &order {
+            if branch_uniform[u] {
+                continue;
+            }
+            let LaneExit::Branch {
+                taken, not_taken, ..
+            } = st.exits[u]
+            else {
+                continue;
+            };
+            if taken == not_taken {
+                continue;
+            }
+            let stop = ipdom[u].min(n);
+            let reach_until = |start: usize| -> Vec<bool> {
+                let mut r = vec![false; n + 1];
+                if start <= n && (start == n || fwd[start]) {
+                    r[start] = true;
+                    let mut stack = Vec::new();
+                    if start != stop && start < n {
+                        stack.push(start);
+                    }
+                    while let Some(x) = stack.pop() {
+                        for &s in &succs[x] {
+                            if s <= n && !r[s] {
+                                r[s] = true;
+                                if s != stop && s < n {
+                                    stack.push(s);
+                                }
+                            }
+                        }
+                    }
+                }
+                r
+            };
+            let r_t = reach_until(taken);
+            let r_f = reach_until(not_taken);
+            for b in 0..n {
+                if r_t[b] && r_f[b] {
+                    div_merge[b] = true;
+                }
+                if (r_t[b] || r_f[b]) && b != stop {
+                    in_div_region[b] = true;
+                }
+            }
+            for (h, in_loop) in &natural_loops {
+                if in_loop[u] && (stop >= n || !in_loop[stop]) {
+                    div_merge[*h] = true;
+                }
+            }
+        }
+
+        let val_op_ok = |inst: &Inst,
+                         op: &Operand,
+                         b: usize,
+                         ii: usize,
+                         use_exec: Bool,
+                         wave_val: &[bool],
+                         in_div: &[bool]|
+         -> bool {
+            match *op {
+                Operand::Literal(_) => true,
+                Operand::Const(k) => crate::resource::inline(k).is_some(),
+                Operand::Scalar { code: NULL, .. } => true,
+                Operand::Scalar { code, dwords } => (0..dwords.max(1)).all(|k| {
+                    let c = code + k;
+                    c != EXEC
+                        && c != EXEC + 1
+                        && inst.read(Reg::S(c)).is_some_and(|v| {
+                            wave_val[v.0 as usize] && exec_reaches(v, b, Some(ii), None, use_exec, in_div)
+                        })
+                }),
+                Operand::Vector { reg, dwords } => (0..dwords.max(1)).all(|k| {
+                    inst.read(Reg::V(reg + k)).is_some_and(|v| {
+                        wave_val[v.0 as usize] && exec_reaches(v, b, Some(ii), None, use_exec, in_div)
+                    })
+                }),
+                Operand::Attr { .. } => false,
+            }
+        };
+
+        let mask_op_ok = |inst: &Inst,
+                          op: &Operand,
+                          b: usize,
+                          ii: usize,
+                          use_exec: Bool,
+                          mask_uni: &[bool],
+                          in_div: &[bool]|
+         -> bool {
+            match *op {
+                Operand::Scalar { code: NULL, .. } => true,
+                Operand::Const(128 | 193) => true,
+                Operand::Literal(0 | u32::MAX) => true,
+                Operand::Scalar { code, .. } if code != EXEC && code != EXEC + 1 => {
+                    inst.read(Reg::S(code)).is_some_and(|m| {
+                        let lo = lo_mask(m);
+                        st.masks.contains_key(&lo)
+                            && mask_uni[lo.0 as usize]
+                            && exec_reaches(lo, b, Some(ii), None, use_exec, in_div)
+                    })
+                }
+                _ => false,
+            }
+        };
+
+        for &b in &order {
+            for phi in &p.blocks[b].phis {
+                let idx = phi.value.0 as usize;
+                if !mask_set.contains(&phi.value) {
+                    if !wave_val[idx] {
+                        continue;
+                    }
+                    let ok = !div_merge[b]
+                        && p.blocks[b]
+                            .preds
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &q)| fwd[q])
+                            .all(|(k, &q)| {
+                                let arg = phi.args[k];
+                                wave_val[arg.0 as usize]
+                                    && exec_reaches(arg, b, None, Some(q), st.entry_exec[b], &in_div_region)
+                            });
+                    if !ok {
+                        wave_val[idx] = false;
+                        changed = true;
+                    }
+                } else if st.masks.contains_key(&phi.value) && mask_uniform[idx] {
+                    let bdd_ok = mask_bdd_is_uniform(st.masks[&phi.value], &wave_val);
+                    let args_ok = !div_merge[b]
+                        && p.blocks[b]
+                            .preds
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &q)| fwd[q])
+                            .all(|(k, &q)| {
+                                let lo = lo_mask(phi.args[k]);
+                                st.masks.contains_key(&lo)
+                                    && mask_uniform[lo.0 as usize]
+                                    && exec_reaches(lo, b, None, Some(q), st.entry_exec[b], &in_div_region)
+                            });
+                    if !(bdd_ok || args_ok) {
+                        mask_uniform[idx] = false;
+                        changed = true;
+                    }
+                }
+            }
+
+            for (ii, inst) in p.blocks[b].insts.iter().enumerate() {
+                let iname = inst.name();
+                match &inst.fields {
+                    Fields::Valu(v) => {
+                        let Some(use_exec) = st.execs[b][ii] else {
+                            continue;
+                        };
+                        let no_extra_scalar = inst.reads.iter().all(|&(r, _)| match r {
+                            Reg::V(_) => true,
+                            Reg::Scc => false,
+                            Reg::S(c) if c == EXEC || c == EXEC + 1 => true,
+                            Reg::S(c) => v.src.iter().any(|op| {
+                                matches!(*op, Operand::Scalar { code, dwords }
+                                    if code != NULL && (code..code + dwords.max(1)).contains(&c))
+                            }),
+                        });
+                        if iname.starts_with("v_cmp_") || iname.starts_with("v_cmpx_") {
+                            let cmp_ok = !iname.starts_with("v_cmpx_")
+                                && st.guards[b][ii].is_none()
+                                && v.dpp.is_none()
+                                && v.sdwa.is_none()
+                                && no_extra_scalar
+                                && v.src.iter().all(|op| {
+                                    val_op_ok(inst, op, b, ii, use_exec, &wave_val, &in_div_region)
+                                });
+                            for &(_, w) in &inst.writes {
+                                let idx = w.0 as usize;
+                                if st.masks.contains_key(&w)
+                                    && mask_uniform[idx]
+                                    && !(cmp_ok
+                                        || (st.guards[b][ii].is_none()
+                                            && mask_bdd_is_uniform(st.masks[&w], &wave_val)))
+                                {
+                                    mask_uniform[idx] = false;
+                                    changed = true;
+                                }
+                            }
+                            continue;
+                        }
+                        if matches!(iname, "v_readfirstlane_b32" | "v_readlane_b32") {
+                            let src_uni = st.guards[b][ii].is_none()
+                                && v.dpp.is_none()
+                                && v.sdwa.is_none()
+                                && no_extra_scalar
+                                && v.src.first().is_some_and(|op| {
+                                    val_op_ok(inst, op, b, ii, use_exec, &wave_val, &in_div_region)
+                                });
+                            let dst_ok = if src_uni {
+                                true
+                            } else if iname == "v_readfirstlane_b32" {
+                                !in_div_region[b] && st.guards[b][ii].is_none()
+                            } else {
+                                spills.get(&(b, ii)).is_some_and(|m| match *m {
+                                    Moved::Const(_) => true,
+                                    Moved::Value(sv) => {
+                                        wave_val[sv.0 as usize]
+                                            && exec_reaches(
+                                                sv,
+                                                b,
+                                                Some(ii),
+                                                None,
+                                                use_exec,
+                                                &in_div_region,
+                                            )
+                                    }
+                                }) || (!in_div_region[b]
+                                    && st.guards[b][ii].is_none()
+                                    && v.src.get(1).is_some_and(|op| {
+                                        val_op_ok(
+                                            inst,
+                                            op,
+                                            b,
+                                            ii,
+                                            use_exec,
+                                            &wave_val,
+                                            &in_div_region,
+                                        )
+                                    }))
+                            };
+                            for &(_, w) in &inst.writes {
+                                let idx = w.0 as usize;
+                                if !mask_set.contains(&w) && wave_val[idx] && !dst_ok {
+                                    wave_val[idx] = false;
+                                    changed = true;
+                                }
+                            }
+                            continue;
+                        }
+
+                        let lane_dep = iname.starts_with("v_mbcnt")
+                            || iname.starts_with("v_permlane")
+                            || iname.contains("permute")
+                            || iname.contains("swizzle")
+                            || iname.starts_with("v_movrel")
+                            || iname.starts_with("v_swap")
+                            || iname.starts_with("v_interp_")
+                            || iname.starts_with("v_div_fmas")
+                            || iname == "v_writelane_b32";
+                        let uses_mask_src2 =
+                            iname == "v_cndmask_b32" || iname.ends_with("_co_ci_u32");
+                        let srcs_ok = if uses_mask_src2 {
+                            v.src.len() >= 3
+                                && val_op_ok(
+                                    inst,
+                                    &v.src[0],
+                                    b,
+                                    ii,
+                                    use_exec,
+                                    &wave_val,
+                                    &in_div_region,
+                                )
+                                && val_op_ok(
+                                    inst,
+                                    &v.src[1],
+                                    b,
+                                    ii,
+                                    use_exec,
+                                    &wave_val,
+                                    &in_div_region,
+                                )
+                                && mask_op_ok(
+                                    inst,
+                                    &v.src[2],
+                                    b,
+                                    ii,
+                                    use_exec,
+                                    &mask_uniform,
+                                    &in_div_region,
+                                )
+                        } else {
+                            v.src.iter().all(|op| {
+                                val_op_ok(inst, op, b, ii, use_exec, &wave_val, &in_div_region)
+                            })
+                        };
+                        let partial_ok = !preserves_valu_dst(iname, v)
+                            || matches!(
+                                v.dst,
+                                Some(Operand::Vector { reg, .. })
+                                    if inst.read(Reg::V(reg)).is_some_and(|old| {
+                                        wave_val[old.0 as usize]
+                                            && exec_reaches(
+                                                old,
+                                                b,
+                                                Some(ii),
+                                                None,
+                                                use_exec,
+                                                &in_div_region,
+                                            )
+                                    })
+                            );
+                        let valu_ok = st.guards[b][ii].is_none()
+                            && v.dpp.is_none()
+                            && !lane_dep
+                            && no_extra_scalar
+                            && srcs_ok
+                            && partial_ok;
+                        for &(_, w) in &inst.writes {
+                            let idx = w.0 as usize;
+                            if st.masks.contains_key(&w) {
+                                if mask_uniform[idx]
+                                    && !(valu_ok
+                                        || (st.guards[b][ii].is_none()
+                                            && mask_bdd_is_uniform(st.masks[&w], &wave_val)))
+                                {
+                                    mask_uniform[idx] = false;
+                                    changed = true;
+                                }
+                            } else if !mask_set.contains(&w) && wave_val[idx] && !valu_ok {
+                                wave_val[idx] = false;
+                                changed = true;
+                            }
+                        }
+                    }
+                    Fields::Sop { src, .. } => {
+                        let writes_exec = inst.write(Reg::S(EXEC)).is_some()
+                            || inst.write(Reg::S(EXEC + 1)).is_some();
+                        let forbidden = writes_exec
+                            || iname.starts_with("s_getreg")
+                            || iname.starts_with("s_setreg")
+                            || iname.starts_with("s_swappc")
+                            || iname.starts_with("s_call")
+                            || iname.starts_with("s_rfe")
+                            || iname.contains("saveexec")
+                            || iname.contains("wrexec")
+                            || iname.starts_with("s_wqm")
+                            || iname.starts_with("s_movrel")
+                            || iname.starts_with("s_subvector_loop")
+                            || iname == "s_version"
+                            || iname.starts_with("s_waitcnt");
+                        let bad_const = src
+                            .iter()
+                            .any(|op| matches!(*op, Operand::Const(k) if crate::resource::inline(k).is_none()));
+                        let ballot_op = iname.starts_with("s_bcnt")
+                            || iname.starts_with("s_ff1")
+                            || iname.starts_with("s_flbit");
+                        let sop_exec = st.exit_exec[b];
+                        let data_reads_ok = !forbidden
+                            && !bad_const
+                            && inst.reads.iter().all(|&(r, val)| {
+                                !matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                                    && if mask_set.contains(&val) {
+                                        ballot_op
+                                            && !in_div_region[b]
+                                            && !def_of[val.0 as usize].is_some_and(|(db, _)| in_div_region[db])
+                                    } else {
+                                        wave_val[val.0 as usize]
+                                            && exec_reaches(
+                                                val,
+                                                b,
+                                                Some(ii),
+                                                None,
+                                                sop_exec,
+                                                &in_div_region,
+                                            )
+                                    }
+                            });
+                        let mask_reads_ok = !forbidden
+                            && !bad_const
+                            && inst.reads.iter().all(|&(r, val)| {
+                                !matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                                    && if mask_set.contains(&val) {
+                                        let lo = lo_mask(val);
+                                        st.masks.contains_key(&lo)
+                                            && mask_uniform[lo.0 as usize]
+                                            && exec_reaches(
+                                                lo,
+                                                b,
+                                                Some(ii),
+                                                None,
+                                                sop_exec,
+                                                &in_div_region,
+                                            )
+                                    } else {
+                                        wave_val[val.0 as usize]
+                                            && exec_reaches(
+                                                val,
+                                                b,
+                                                Some(ii),
+                                                None,
+                                                sop_exec,
+                                                &in_div_region,
+                                            )
+                                    }
+                            });
+                        for &(_, w) in &inst.writes {
+                            let idx = w.0 as usize;
+                            if st.masks.contains_key(&w) {
+                                if mask_uniform[idx]
+                                    && !(mask_reads_ok
+                                        || (!writes_exec
+                                            && !iname.contains("saveexec")
+                                            && !iname.contains("wrexec")
+                                            && mask_bdd_is_uniform(st.masks[&w], &wave_val)))
+                                {
+                                    mask_uniform[idx] = false;
+                                    changed = true;
+                                }
+                            } else if !mask_set.contains(&w) && wave_val[idx] && !data_reads_ok {
+                                wave_val[idx] = false;
+                                changed = true;
+                            }
+                        }
+                    }
+                    Fields::Smem { .. } => {
+                        let smem_ok = (iname.starts_with("s_load_")
+                            || iname.starts_with("s_buffer_load_"))
+                            && inst.reads.iter().all(|&(_, val)| {
+                                wave_val[val.0 as usize]
+                                    && exec_reaches(
+                                        val,
+                                        b,
+                                        Some(ii),
+                                        None,
+                                        st.exit_exec[b],
+                                        &in_div_region,
+                                    )
+                            });
+                        for &(_, w) in &inst.writes {
+                            let idx = w.0 as usize;
+                            if !mask_set.contains(&w) && wave_val[idx] && !smem_ok {
+                                wave_val[idx] = false;
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        for &(_, w) in &inst.writes {
+                            let idx = w.0 as usize;
+                            if wave_val[idx] {
+                                wave_val[idx] = false;
+                                changed = true;
+                            }
+                            if mask_uniform[idx] {
+                                mask_uniform[idx] = false;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut reads = HashSet::new();
+    for &b in &order {
+        for (ii, inst) in p.blocks[b].insts.iter().enumerate() {
+            if !matches!(inst.name(), "v_readfirstlane_b32" | "v_readlane_b32") {
+                continue;
+            }
+            let Fields::Valu(v) = &inst.fields else {
+                continue;
+            };
+            if st.guards[b][ii].is_some() || v.dpp.is_some() || v.sdwa.is_some() {
+                continue;
+            }
+            let Some(use_exec) = st.execs[b][ii] else {
+                continue;
+            };
+            let no_extra_scalar = inst.reads.iter().all(|&(r, _)| match r {
+                Reg::V(_) => true,
+                Reg::Scc => false,
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => true,
+                Reg::S(c) => v.src.iter().any(|op| {
+                    matches!(*op, Operand::Scalar { code, dwords }
+                        if code != NULL && (code..code + dwords.max(1)).contains(&c))
+                }),
+            });
+            if !no_extra_scalar {
+                continue;
+            }
+            let src0_ok = v.src.first().is_some_and(|op| match *op {
+                Operand::Literal(_) => true,
+                Operand::Const(k) => crate::resource::inline(k).is_some(),
+                Operand::Scalar { code: NULL, .. } => true,
+                Operand::Scalar { code, dwords } => (0..dwords.max(1)).all(|k| {
+                    let c = code + k;
+                    c != EXEC
+                        && c != EXEC + 1
+                        && inst.read(Reg::S(c)).is_some_and(|val| {
+                            wave_val[val.0 as usize]
+                                && exec_reaches(
+                                    val,
+                                    b,
+                                    Some(ii),
+                                    None,
+                                    use_exec,
+                                    &in_div_region,
+                                )
+                        })
+                }),
+                Operand::Vector { reg, dwords } => (0..dwords.max(1)).all(|k| {
+                    inst.read(Reg::V(reg + k)).is_some_and(|val| {
+                        wave_val[val.0 as usize]
+                            && exec_reaches(
+                                val,
+                                b,
+                                Some(ii),
+                                None,
+                                use_exec,
+                                &in_div_region,
+                            )
+                    })
+                }),
+                Operand::Attr { .. } => false,
+            });
+            if src0_ok {
+                reads.insert((b, ii));
+            }
+        }
+    }
+    reads
+}
+
 /// Masks read as data in a block other than their defining block, keyed by defining block (`None` = entry).
 fn collect_cross_block_masks(
     p: &Program,
@@ -894,8 +1770,15 @@ impl<'a> Lower<'a> {
         let mut need_lds_barriers = false;
         let mut spills = HashMap::new();
         let mut uniform = Vec::new();
-        let mut val_uniform = Vec::new();
         let mut cross_block_masks = HashMap::new();
+
+        if let StageIo::Cs(_) = x.native.io
+            && x.native.wave64
+            && matches!(x.options.wave64, Wave64Mode::Wave32 | Wave64Mode::Emulate)
+        {
+            spills = spilled_sgprs(p);
+        }
+        let uniform_lane_reads = compute_wave_uniformity(p, x.st, x.res, &x.io.inputs, &spills);
 
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -905,14 +1788,19 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
-                let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
+            console_lanes = p.blocks.iter().enumerate().any(|(b, blk)| {
+                blk.insts.iter().enumerate().any(|(ii, i)| {
+                    let n = i.name();
+                    n.starts_with("ds_swizzle")
+                        || n.contains("permute")
+                        || n.starts_with("v_mbcnt")
+                        || (n == "v_readlane_b32"
+                            && !spills.contains_key(&(b, ii))
+                            && !uniform_lane_reads.contains(&(b, ii)))
+                        || n == "v_writelane_b32"
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                        || reads_mask_as_data(x.st, i)
+                })
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -961,20 +1849,18 @@ impl<'a> Lower<'a> {
                     }
                 }
                 Wave64Mode::Wave32 | Wave64Mode::Emulate => {
-                    spills = spilled_sgprs(p);
-                    (uniform, val_uniform) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
-                    let has_non_uniform_firstlane = insts().any(|i| {
-                        i.name() == "v_readfirstlane_b32"
-                            && matches!(
-                                &i.fields,
-                                Fields::Valu(v)
-                                    if matches!(v.src.first(), Some(Operand::Vector { reg, .. })
-                                        if i.read(Reg::V(*reg)).is_some_and(|val| !val_uniform[val.0 as usize]))
-                            )
+                    (uniform, _) = compute_uniformity(p, x.st, x.res, &x.io.inputs);
+                    let has_non_uniform_firstlane = p.blocks.iter().enumerate().any(|(b, blk)| {
+                        blk.insts.iter().enumerate().any(|(ii, i)| {
+                            i.name() == "v_readfirstlane_b32"
+                                && !uniform_lane_reads.contains(&(b, ii))
+                        })
                     });
                     let has_unresolved_readlane = p.blocks.iter().enumerate().any(|(b, blk)| {
                         blk.insts.iter().enumerate().any(|(i, inst)| {
-                            inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
+                            inst.name() == "v_readlane_b32"
+                                && !spills.contains_key(&(b, i))
+                                && !uniform_lane_reads.contains(&(b, i))
                         })
                     });
                     let need_emu =
@@ -1198,7 +2084,7 @@ impl<'a> Lower<'a> {
             need_lds_barriers,
             spills,
             uniform,
-            val_uniform,
+            uniform_lane_reads,
             wave_ids: None,
             guard_depth: 0,
             cross_block_masks,
@@ -5491,7 +6377,11 @@ impl<'a> Lower<'a> {
                     };
                     return int(self, r);
                 }
-                let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                let a = s(self, 0)?;
+                if self.uniform_lane_reads.contains(&(b, i)) {
+                    return int(self, a);
+                }
+                let lane = s(self, 1)?;
                 if self.emulating_wave64() {
                     self.cross_lane(false)?;
                     let r = self.exchange_64(a, lane)?;
@@ -5532,17 +6422,10 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
-                let non_uniform = v.src.first().is_some_and(|op| match *op {
-                    Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).is_some_and(|val| {
-                        !self
-                            .val_uniform
-                            .get(val.0 as usize)
-                            .copied()
-                            .unwrap_or(false)
-                    }),
-                    _ => false,
-                });
-                if self.emulating_wave64() && (self.console_lanes || non_uniform) {
+                if self.uniform_lane_reads.contains(&(b, i)) {
+                    return int(self, a);
+                }
+                if self.emulating_wave64() {
                     self.cross_lane(false)?;
                     let r = self.emulated_readfirstlane(a, guard)?;
                     return int(self, r);
