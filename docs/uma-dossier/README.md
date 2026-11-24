@@ -11,6 +11,14 @@ black under VIctory on a discrete-GPU PC, and which approaches could fix it.*
   URLs fetched; entries that could not be confirmed are marked `[unverified]`.
 - **Discussion:** see the linked VIctory issue; please comment with results (confirmed / refuted / measured numbers).
 
+### Legal note
+
+All measurements were made with files from a retail copy of the title that the author bought and owns, on his own
+Xbox console; proof of purchase is kept. No leaked, pirated or third-party files were used at any point. No game data
+(assets, code, disassembly, shader dumps or screenshots) is published here or in the linked issue. This work is about
+memory-coherence, synchronization and shader-translation techniques; it does not provide, link to or help anyone obtain
+game files.
+
 ## Contents
 
 1. [Chapter 01 — Fundamentals: Unified vs. Discrete Memory Architectures and Why UMA Titles Collapse on Discrete-GPU Windows PCs](ch01.md)
