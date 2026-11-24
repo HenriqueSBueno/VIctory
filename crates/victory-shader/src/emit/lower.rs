@@ -9063,14 +9063,14 @@ mod tests {
             0x0000_00ff, // s_and_b32 s3, s1, 0xff
             0xBE82_0300, // s_mov_b32 s2, s0
         ];
-        // s_load_dwordx4 s[8:11], s[2:3], 0x10 -> user_data 20..23 (Constants, slot 1)
+        // s_load_dwordx4 s[8:11], s[2:3], 0x10 -> user_data 36..23 (Constants, slot 1)
         words.extend_from_slice(&smem_load(0x02, 8, 2, 125, 0x10));
-        // s_load_dwordx2 s[4:5], s[2:3], 0x00 -> user_data 16..17 (Descriptor SRV, slot 0)
+        // s_load_dwordx2 s[4:5], s[2:3], 0x00 -> user_data 32..17 (Descriptor SRV, slot 0)
         words.extend_from_slice(&smem_load(0x01, 4, 2, 125, 0x00));
         // Build raw buffer descriptor in s[4:7]: s6 = -1, s7 = 0x11014fac
         words.push(0xBE86_03C1); // s_mov_b32 s6, -1
         words.extend_from_slice(&[0xBE87_03FF, 0x1101_4FAC]); // s_mov_b32 s7, 0x11014fac
-        // v1 = s11 (user_data 23), buffer_load_dword v0, v1, s[4:7], s8 offen
+        // v1 = s11 (user_data 39), buffer_load_dword v0, v1, s[4:7], s8 offen
         words.push(v_mov_b32(1, 11));
         words.extend_from_slice(&[
             (0x38 << 26) | (0x0C << 18) | (1 << 12),
@@ -9085,7 +9085,7 @@ mod tests {
                 table_offset_dwords: 0,
                 sgprs: 2,
                 base_register: 0,
-                user_data: 16,
+                user_data: 32,
                 slot: 0,
             },
             RootParam {
@@ -9093,36 +9093,36 @@ mod tests {
                 table_offset_dwords: 0,
                 sgprs: 16,
                 base_register: 0,
-                user_data: 20,
+                user_data: 36,
                 slot: 1,
             },
         ];
         let used = vec![UsedResource {
             kind: ResourceType::Srv,
             root: RootType::Descriptor,
-            user_data: 16,
+            user_data: 32,
             slot: 0,
             table_offset_dwords: 0,
             lower_bound: 0,
             dwords: 4,
             stride: 0,
         }];
-        let mut ud = vec![0u32; 24];
-        ud[20] = 0x40;
-        ud[23] = 0x100;
+        let mut ud = vec![0u32; 40];
+        ud[36] = 0x40;
+        ud[39] = 0x100;
         let (lowered, loads) = lower_ps(&words, layout, used, &ud).unwrap();
         assert_eq!(lowered.root_srvs, vec![0]);
         assert_eq!(
             lowered.user_data,
             vec![
                 UserData {
-                    index: 20,
+                    index: 36,
                     slot: 1,
                     root: RootType::Constants,
                     dword: 0,
                 },
                 UserData {
-                    index: 23,
+                    index: 39,
                     slot: 1,
                     root: RootType::Constants,
                     dword: 3,
@@ -9142,10 +9142,10 @@ mod tests {
             0x0000_00ff, // s_and_b32 s3, s1, 0xff
             0xBE82_0300, // s_mov_b32 s2, s0
         ];
-        // s_load_dword s4, s[2:3], 0x00 -> user_data 16 (Table, slot 2)
+        // s_load_dword s4, s[2:3], 0x00 -> user_data 32 (Table, slot 2)
         words.extend_from_slice(&smem_load(0x00, 4, 2, 125, 0x00));
         words.push(0xBE85_0380); // s_mov_b32 s5, 0
-        // s_load_dword s6, s[2:3], 0x08 -> user_data 18 (Constants, slot 3)
+        // s_load_dword s6, s[2:3], 0x08 -> user_data 34 (Constants, slot 3)
         words.extend_from_slice(&smem_load(0x00, 6, 2, 125, 0x08));
         // s_load_dwordx4 s[8:11], s[4:5], 0x20 -> descriptor from Table
         words.extend_from_slice(&smem_load(0x02, 8, 4, 125, 0x20));
@@ -9160,7 +9160,7 @@ mod tests {
                 table_offset_dwords: 0,
                 sgprs: 1,
                 base_register: 0,
-                user_data: 16,
+                user_data: 32,
                 slot: 2,
             },
             RootParam {
@@ -9168,26 +9168,26 @@ mod tests {
                 table_offset_dwords: 0,
                 sgprs: 2,
                 base_register: 0,
-                user_data: 18,
+                user_data: 34,
                 slot: 3,
             },
         ];
-        let mut ud = vec![0u32; 20];
-        ud[16] = 0x100;
-        ud[18] = 0x20;
+        let mut ud = vec![0u32; 36];
+        ud[32] = 0x100;
+        ud[34] = 0x20;
         let (lowered, _) = lower_ps(&words, layout, vec![], &ud).unwrap();
         assert_eq!(lowered.descriptor_tables, vec![2]);
         assert_eq!(
             lowered.user_data,
             vec![
                 UserData {
-                    index: 16,
+                    index: 32,
                     slot: 2,
                     root: RootType::Table,
                     dword: 0,
                 },
                 UserData {
-                    index: 18,
+                    index: 34,
                     slot: 3,
                     root: RootType::Constants,
                     dword: 0,

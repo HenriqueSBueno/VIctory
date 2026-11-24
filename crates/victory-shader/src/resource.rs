@@ -259,9 +259,10 @@ impl<'a> Tracer<'a> {
             spill_loads: Vec::new(),
         };
         t.origin = t.propagate_copies(n)?;
-        let has_spill = layout
-            .iter()
-            .any(|rp| rp.user_data >= 16 || u32::from(rp.user_data) + rp.sgprs > 16);
+        let has_spill = layout.iter().any(|rp| {
+            u32::from(rp.user_data) >= user_sgpr_limit(stage)
+                || u32::from(rp.user_data) + rp.sgprs > user_sgpr_limit(stage)
+        });
         if has_spill {
             let u0 = Reg::S(stage.user_sgpr(0));
             let u1 = Reg::S(stage.user_sgpr(1));
@@ -360,12 +361,13 @@ impl<'a> Tracer<'a> {
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
-            if p.user_data >= 16 {
+            if u32::from(p.user_data) >= user_sgpr_limit(self.stage) {
                 return None;
             }
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
-            (dword < p.sgprs && u32::from(p.user_data) + dword < 16).then_some((i, dword))
+            (dword < p.sgprs && u32::from(p.user_data) + dword < user_sgpr_limit(self.stage))
+                .then_some((i, dword))
         })
     }
 
@@ -380,7 +382,7 @@ impl<'a> Tracer<'a> {
 
     /// Layout index and dword covering spilled user-data slot `ud >= 16`.
     fn spilled_param_of(&self, ud: u32) -> Option<(usize, u32)> {
-        if ud < 16 {
+        if ud < user_sgpr_limit(self.stage) {
             return None;
         }
         self.layout.iter().enumerate().find_map(|(i, p)| {
@@ -480,7 +482,9 @@ impl<'a> Tracer<'a> {
                 if byte_off < 0 || byte_off % 4 != 0 {
                     return Err(fail("an unaligned spill-table load"));
                 }
-                let Ok(first_ud) = u32::try_from(16 + byte_off / 4) else {
+                let Ok(first_ud) =
+                    u32::try_from(i64::from(user_sgpr_limit(self.stage)) + byte_off / 4)
+                else {
                     return Err(fail("a spill-table load outside the root layout"));
                 };
                 let mut matched = false;
@@ -1142,6 +1146,12 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
     }
 }
 
+/// How many user SGPRs the hardware loads for `stage` before the rest of the user data spills to memory: GFX10
+/// compute has 16, the graphics stages 32.
+fn user_sgpr_limit(stage: HwStage) -> u32 {
+    if matches!(stage, HwStage::Cs) { 16 } else { 32 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,7 +1432,7 @@ mod tests {
         let mut words = Vec::new();
         words.extend_from_slice(&s_and_b32_imm(11, 9, 0xff));
         words.push(s_mov_b32_s(10, 8));
-        // s_load_dword s4, s[10:11], 0x00 -> user_data 16 (Table, param 0)
+        // s_load_dword s4, s[10:11], 0x00 -> user_data 32 (Table, param 0): graphics stages load 32 user SGPRs
         words.extend_from_slice(&smem_load(0, 4, 10, 125, 0x00));
         words.push(0xBE85_0380); // s_mov_b32 s5, 0
         // s_load_dwordx4 s[12:15], s[4:5], 0x20 -> descriptor from Table
@@ -1432,7 +1442,7 @@ mod tests {
             0x8003_0400, // buffer_load_format_x v4, v0, s[12:15], 0 idxen
             S_ENDPGM,
         ]);
-        let r = track_words(&words, &[param(Table, 16, 1)], HwStage::Ms);
+        let r = track_words(&words, &[param(Table, 32, 1)], HwStage::Ms);
         assert_eq!(r.spill_loads, [(0, 2)]);
         assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
         assert_eq!(
