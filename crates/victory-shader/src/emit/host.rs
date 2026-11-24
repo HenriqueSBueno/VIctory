@@ -203,6 +203,19 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        if stages.iter().any(|(s, _)| s.view_heap) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::HEAP_SRV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -573,6 +586,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        view_heap: false,
+        descriptor_tables: Vec::new(),
     }
 }
 
@@ -828,7 +843,29 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { srv, data } => {
+                        let b = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buf_desc((data.len() * 4).next_multiple_of(256) as u64),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                            None,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        b.Map(0, None, Some(&mut p)).map_err(err)?;
+                        std::ptr::copy_nonoverlapping(
+                            data.as_ptr().cast::<u8>(),
+                            p.cast::<u8>(),
+                            data.len() * 4,
+                        );
+                        b.Unmap(0, None);
+                        let va = b.GetGPUVirtualAddress();
+                        if *srv {
+                            list.SetGraphicsRootShaderResourceView(*param, va);
+                        } else {
+                            list.SetGraphicsRootConstantBufferView(*param, va);
+                        }
+                        keep.push(b);
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1444,6 +1481,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            view_heap: false,
+            descriptor_tables: Vec::new(),
         }
     }
 

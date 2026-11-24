@@ -12,6 +12,9 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the raw buffer SRV over the title's view descriptor heap is bound:
+/// `t0` in this space.
+pub const HEAP_SRV_SPACE: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -65,6 +68,8 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Handle of the view-heap raw buffer SRV (`t0` in [`HEAP_SRV_SPACE`]).
+    pub view_heap: Option<V>,
     pub flags: u64,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
@@ -118,6 +123,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            view_heap: None,
             flags: 0,
             threads: None,
             wave_size: None,
@@ -233,6 +239,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the raw buffer SRV over the title's view descriptor
+    /// heap (`t0` in [`HEAP_SRV_SPACE`]), made in the entry block.
+    pub fn view_heap_handle(&mut self) -> V {
+        if let Some(h) = self.view_heap {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(HEAP_SRV_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.view_heap = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -306,6 +337,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || self.view_heap.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -360,20 +392,28 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            let mut srv_slots: Vec<(u32, u32)> = self
+                .root_srvs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if self.view_heap.is_some() {
+                srv_slots.push((HEAP_SRV_SPACE, 0));
+            }
+            if !srv_slots.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, slot)) in srv_slots.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, slot)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -382,8 +422,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register: slot,
                         dxil_kind: 11,
                     });
                 }

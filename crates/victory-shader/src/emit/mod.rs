@@ -29,6 +29,18 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
+//! * **View-heap data reads**: shaders that read descriptor-table or
+//!   resource-heap memory as plain numeric data (scalar `s_load_dword*` or
+//!   vector `global_load_*` loads at table/heap base + offset) read a raw
+//!   buffer SRV (`ByteAddressBuffer`) bound at `t0` in [`HEAP_SRV_SPACE`]
+//!   over a host copy of the bound view descriptor heap's bytes
+//!   ([`HostShader::view_heap`]). [`HostShader::descriptor_tables`] lists
+//!   only the `RootType::Table` slots used as descriptors; tables read
+//!   only as data are left out so the host does not mirror or remap them,
+//!   keeping their [`UserData`] as the title's view-heap byte offset. When
+//!   the same stage uses one `RootType::Table` slot for both descriptors
+//!   and raw data, the data path reads a separate [`UserData`] entry with
+//!   `dword = 1` holding the un-remapped view-heap byte offset.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -97,7 +109,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{HEAP_SRV_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -156,6 +168,13 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Whether the shader reads view-heap memory as raw data through `t0`
+    /// in [`HEAP_SRV_SPACE`].
+    pub view_heap: bool,
+    /// Root parameter indices of `RootType::Table` tables from which the
+    /// shader loads descriptors (`ResourceDescriptorHeap[]` /
+    /// `SamplerDescriptorHeap[]`).
+    pub descriptor_tables: Vec<u8>,
 }
 
 impl HostShader {
@@ -346,6 +365,8 @@ pub fn emit_with(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        view_heap: l.view_heap,
+        descriptor_tables: l.descriptor_tables,
     })
 }
 
@@ -602,6 +623,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            view_heap: false,
+            descriptor_tables: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -612,6 +635,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                view_heap: false,
+                descriptor_tables: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

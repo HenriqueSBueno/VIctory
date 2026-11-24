@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
@@ -29,12 +29,20 @@ enum Val {
     Missing(Why),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DataTarget {
+    Raw(V),
+    Cbv(V),
+}
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub view_heap: bool,
+    pub descriptor_tables: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
 }
@@ -59,11 +67,18 @@ enum Stop {
     Fail(ShaderError),
 }
 
-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+fn lower_with<R>(
+    parts: &Parts,
+    mut inspect: impl FnMut(&Lower) -> R,
+) -> Result<(Lowered, R), ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
-            Ok(l) => return Ok(l),
+        let mut l = Lower::new(parts, &bad);
+        match l.run_body() {
+            Ok(()) => {
+                let extra = inspect(&l);
+                return Ok((l.into_lowered(), extra));
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -75,6 +90,18 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+}
+
+pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with(parts, |_| ()).map(|(l, ())| l)
+}
+
+#[cfg(test)]
+pub(crate) fn lower_with_loads(
+    parts: &Parts,
+    user_data: &[u32],
+) -> Result<(Lowered, Vec<super::bitcode::RawLoadTrace>), ShaderError> {
+    lower_with(parts, |l| l.s.m.raw_buffer_loads(user_data))
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -249,6 +276,140 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// SSA values read by non-descriptor operands or phi arguments.
+    data_reads: HashSet<Value>,
+    /// `RootType::Table` slots used by descriptor loads (`ResourceDescriptorHeap[]` /
+    /// `SamplerDescriptorHeap[]`).
+    descriptor_tables: Vec<u8>,
+    /// Synthetic user-data indices (`dword = 1`) for `RootType::Table` slots
+    /// used both as descriptors and as raw view-heap data in this stage.
+    mixed_table_ud: HashMap<u8, u32>,
+    /// Cached entry-block loads of `mixed_table_ud` by root parameter slot.
+    mixed_table_vals: HashMap<u8, V>,
+}
+
+/// Dwords read by `s_load_dword*`.
+fn smem_dword_count(name: &str) -> Option<u32> {
+    match name.strip_prefix("s_load_dword")? {
+        "" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        "x8" => Some(8),
+        "x16" => Some(16),
+        _ => None,
+    }
+}
+
+/// Number of SGPR dwords a descriptor operand uses at `d_site`.
+fn descriptor_dwords(p: &Program, d_site: Site, role: Role) -> u8 {
+    let inst = &p.blocks[d_site.0].insts[d_site.1];
+    match &inst.fields {
+        Fields::Image { rsrc, sampler, .. } => {
+            let op = if role == Role::Sampler {
+                sampler.as_ref()
+            } else {
+                Some(rsrc)
+            };
+            match op {
+                Some(Operand::Scalar { dwords, .. }) => *dwords,
+                _ => 8,
+            }
+        }
+        Fields::Buffer {
+            rsrc: Operand::Scalar { dwords, .. },
+            ..
+        }
+        | Fields::Smem {
+            base: Operand::Scalar { dwords, .. },
+            ..
+        } => *dwords,
+        _ => 4,
+    }
+}
+
+/// Descriptor uses referencing `load == site`: `(role, use_site, first, dwords)`.
+fn descriptor_spans(x: &Parts<'_>, site: Site) -> Vec<(Role, Site, u8, u8)> {
+    let mut out = Vec::new();
+    for d in &x.res.descriptors {
+        let dwords = descriptor_dwords(x.p, d.site, d.role);
+        for leaf in d.source.leaves() {
+            if let Source::Loaded { load, first } = *leaf
+                && load == site
+            {
+                out.push((d.role, d.site, first, dwords));
+            }
+        }
+    }
+    out
+}
+
+/// Whether `native.used` marks `RootType::Table` parameter `param` as a sampler table.
+fn is_sampler_table(native: &NativeProgram, param: usize) -> bool {
+    let Some(rp) = native.layout.get(param) else {
+        return false;
+    };
+    rp.root == RootType::Table
+        && native
+            .used
+            .iter()
+            .any(|u| u.root == RootType::Table && u.slot == rp.slot && u.kind == ResourceType::Sampler)
+}
+
+/// All SSA values read anywhere other than solely as descriptor operands.
+fn non_descriptor_reads(p: &Program) -> HashSet<Value> {
+    let mut reads = HashSet::new();
+    for block in &p.blocks {
+        for phi in &block.phis {
+            reads.extend(phi.args.iter().copied());
+        }
+        for inst in &block.insts {
+            let mut desc_regs = [false; 128];
+            let mut mark = |op: &Operand, on: bool| {
+                if let Operand::Scalar { code, dwords } = *op {
+                    for r in code..code.saturating_add(dwords) {
+                        if let Some(slot) = desc_regs.get_mut(usize::from(r)) {
+                            *slot = on;
+                        }
+                    }
+                }
+            };
+            match &inst.fields {
+                Fields::Image { rsrc, sampler, .. } => {
+                    mark(rsrc, true);
+                    if let Some(s) = sampler {
+                        mark(s, true);
+                    }
+                }
+                Fields::Buffer { rsrc, soffset, .. } => {
+                    mark(rsrc, true);
+                    mark(soffset, false);
+                }
+                Fields::Smem {
+                    base,
+                    soffset,
+                    data,
+                    ..
+                } if inst.name().starts_with("s_buffer_") => {
+                    mark(base, true);
+                    mark(soffset, false);
+                    if let Some(d) = data {
+                        mark(d, false);
+                    }
+                }
+                _ => {}
+            }
+            for &(reg, val) in &inst.reads {
+                let is_desc = matches!(
+                    reg,
+                    Reg::S(r) if desc_regs.get(usize::from(r)).copied().unwrap_or(false)
+                );
+                if !is_desc {
+                    reads.insert(val);
+                }
+            }
+        }
+    }
+    reads
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -920,6 +1081,69 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let data_reads = non_descriptor_reads(p);
+        let mut descriptor_tables_set = BTreeSet::new();
+        for d in &x.res.descriptors {
+            for leaf in d.source.leaves() {
+                if let Source::Loaded { load, .. } = *leaf
+                    && let Some(a) = scalar.get(&load)
+                    && let Some(rp) = x.native.layout.get(a.param)
+                    && rp.root == RootType::Table
+                {
+                    descriptor_tables_set.insert(rp.slot);
+                }
+            }
+        }
+        let mut data_tables_set = BTreeSet::new();
+        for &(site, a) in &x.res.scalar {
+            let Some(rp) = x.native.layout.get(a.param) else {
+                continue;
+            };
+            if rp.root != RootType::Table || is_sampler_table(x.native, a.param) {
+                continue;
+            }
+            let inst = &p.blocks[site.0].insts[site.1];
+            if matches!(inst.fields, Fields::Flat { .. }) {
+                if inst.name().starts_with("global_load_") {
+                    data_tables_set.insert(rp.slot);
+                }
+                continue;
+            }
+            if let Some(count) = smem_dword_count(inst.name())
+                && let Fields::Smem {
+                    data: Some(Operand::Scalar { code, .. }),
+                    ..
+                } = inst.fields
+            {
+                let spans = descriptor_spans(x, site);
+                let has_data = (0..count).any(|k| {
+                    !spans
+                        .iter()
+                        .any(|&(_, _, first, dw)| k >= u32::from(first) && k < u32::from(first + dw))
+                        && inst
+                            .write(Reg::S(code + k as u8))
+                            .is_some_and(|v| data_reads.contains(&v))
+                });
+                if has_data {
+                    data_tables_set.insert(rp.slot);
+                }
+            }
+        }
+        let base_ud = x
+            .native
+            .layout
+            .iter()
+            .filter(|rp| matches!(rp.root, RootType::Constants | RootType::Table))
+            .map(|rp| u32::from(rp.user_data) + rp.sgprs)
+            .max()
+            .unwrap_or(0);
+        let mixed_table_ud: HashMap<u8, u32> = (base_ud..)
+            .zip(descriptor_tables_set.intersection(&data_tables_set).copied())
+            .map(|(ud, slot)| (slot, ud))
+            .collect();
+        let descriptor_tables: Vec<u8> = descriptor_tables_set.into_iter().collect();
+
         Lower {
             s,
             x,
@@ -946,7 +1170,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -991,6 +1215,10 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            data_reads,
+            descriptor_tables,
+            mixed_table_ud,
+            mixed_table_vals: HashMap::new(),
         }
     }
 
@@ -1090,6 +1318,25 @@ impl<'a> Lower<'a> {
         }
         let h = if a.param == CODE {
             None
+        } else if let Some(rp) = self.x.native.layout.get(a.param)
+            && matches!(rp.root, RootType::Table | RootType::ResourceHeap)
+        {
+            if rp.root == RootType::Table && is_sampler_table(self.x.native, a.param) {
+                return Err("a sampler descriptor read as data");
+            }
+            if rp.root == RootType::Table {
+                let base = self.table_data_base(a.param)?;
+                off = self.s.m.bin(c, Bin::Add, base, off);
+            }
+            Some(self.s.view_heap_handle())
+        } else if self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .is_some_and(|rp| rp.root == RootType::SamplerHeap)
+        {
+            return Err("a sampler heap read as data");
         } else {
             let src = Source::Built {
                 address: a,
@@ -1101,20 +1348,7 @@ impl<'a> Lower<'a> {
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
-                Some(h) => {
-                    let c = l.cur;
-                    let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
-                    let r = l.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        l.s.t.res_ret,
-                        139,
-                        &[h, byte, u, mask, al],
-                    );
-                    let x = l.s.m.extract(c, r, 0);
-                    Ok(l.as_int(x))
-                }
+                Some(h) => Ok(l.raw_dword(h, byte)),
             }
         };
         for k in 0..n {
@@ -1795,7 +2029,7 @@ impl<'a> Lower<'a> {
         Ok(local_bits)
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run_body(&mut self) -> Result<(), Stop> {
         if self.lds_overflow {
             return Err(unsupported(0, "LDS exceeding 32 KiB with wave64 emulation"));
         }
@@ -1880,19 +2114,27 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        Ok(())
+    }
+
+    fn into_lowered(mut self) -> Lowered {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let view_heap = self.s.view_heap.is_some();
+        let descriptor_tables = std::mem::take(&mut self.descriptor_tables);
         let cmp_samplers = self.s.cmp_samplers;
-        Ok(Lowered {
+        Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            view_heap,
+            descriptor_tables,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
-        })
+        }
     }
 
     fn exported_out(&self, b: usize) -> bool {
@@ -2128,12 +2370,16 @@ impl<'a> Lower<'a> {
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
+        Val::I32(self.read_user_dword(index, rp.slot, rp.root, dword))
+    }
+
+    fn read_user_dword(&mut self, index: u32, slot: u8, root: RootType, dword: u32) -> V {
         self.user_reads.insert(
             index,
             UserData {
                 index,
-                slot: rp.slot,
-                root: rp.root,
+                slot,
+                root,
                 dword,
             },
         );
@@ -2156,7 +2402,33 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
+    }
+
+    /// View-heap byte offset of `RootType::Table` / `RootType::ResourceHeap`
+    /// parameter `param` for raw heap-data reads (never remapped by fresh
+    /// descriptor tables).
+    fn table_data_base(&mut self, param: usize) -> Result<V, Why> {
+        let rp = self.x.native.layout[param];
+        match rp.root {
+            RootType::ResourceHeap => Ok(self.s.m.i32(0)),
+            RootType::Table => {
+                if let Some(&index) = self.mixed_table_ud.get(&rp.slot) {
+                    if let Some(&v) = self.mixed_table_vals.get(&rp.slot) {
+                        return Ok(v);
+                    }
+                    let v = self.read_user_dword(index, rp.slot, rp.root, 1);
+                    self.mixed_table_vals.insert(rp.slot, v);
+                    return Ok(v);
+                }
+                match self.user(param, 0) {
+                    Val::I32(v) => Ok(v),
+                    Val::Missing(w) => Err(w),
+                    Val::Bit(_) => unreachable!(),
+                }
+            }
+            _ => Err("a descriptor outside the heaps"),
+        }
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -3864,18 +4136,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+                let x = self.raw_dword(h, a);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -3923,18 +4184,104 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-    /// the code also reads as numbers: the console compiler computes sizes
-    /// from descriptor bits (an image's width, height, depth, levels; a
-    /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
-    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
-    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
-    // level 0, so sizes the code shifts by it come out right) and the other
-    // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
+    /// Reads one 32-bit dword at byte address `byte_addr` of raw buffer `h`.
+    fn raw_dword(&mut self, h: V, byte_addr: V) -> V {
+        let c = self.cur;
+        let mask = self.s.m.i8(1);
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte_addr, u, mask, al],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
+    /// Raw or constant buffer handle and starting byte address for a scalar
+    /// load from table, resource-heap, or root-descriptor memory read as data.
+    fn scalar_data_source(&mut self, site: Site) -> Result<(DataTarget, V), Why> {
+        let a = self
+            .scalar
+            .get(&site)
+            .copied()
+            .ok_or("a descriptor read only as data")?;
+        let rp = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .copied()
+            .ok_or("a descriptor read only as data")?;
+        let c = self.cur;
+        match rp.root {
+            RootType::Table | RootType::ResourceHeap => {
+                if rp.root == RootType::Table && is_sampler_table(self.x.native, a.param) {
+                    return Err("a sampler descriptor read as data");
+                }
+                let mut addr = self.table_data_base(a.param)?;
+                if a.offset != 0 {
+                    let off = self.s.m.i32(a.offset);
+                    addr = self.s.m.bin(c, Bin::Add, addr, off);
+                }
+                if let Some(d) = a.dynamic {
+                    let d = self.i32_of(d)?;
+                    addr = self.s.m.bin(c, Bin::Add, addr, d);
+                }
+                Ok((DataTarget::Raw(self.s.view_heap_handle()), addr))
+            }
+            RootType::Descriptor => {
+                let kind = self
+                    .x
+                    .native
+                    .used
+                    .iter()
+                    .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data)
+                    .map(|u| u.kind);
+                let mut addr = self.s.m.i32(a.offset);
+                if let Some(d) = a.dynamic {
+                    let d = self.i32_of(d)?;
+                    addr = self.s.m.bin(c, Bin::Add, addr, d);
+                }
+                match kind {
+                    Some(ResourceType::Srv) => {
+                        Ok((DataTarget::Raw(self.s.root_srv_handle(rp.slot)), addr))
+                    }
+                    Some(ResourceType::Cbv) | None => {
+                        Ok((DataTarget::Cbv(self.s.root_cbv_handle(rp.slot)), addr))
+                    }
+                    _ => Err("a root UAV or typed root view"),
+                }
+            }
+            RootType::SamplerHeap => Err("a sampler heap read as data"),
+            _ => Err("a descriptor read only as data"),
+        }
+    }
+
+    fn load_data_dword(&mut self, target: DataTarget, base: V, k: u32) -> V {
+        let c = self.cur;
+        let at = if k == 0 {
+            base
+        } else {
+            let off = self.s.m.i32(4 * k);
+            self.s.m.bin(c, Bin::Add, base, off)
+        };
+        match target {
+            DataTarget::Raw(h) => self.raw_dword(h, at),
+            DataTarget::Cbv(h) => self.cbuffer_dword(h, at),
+        }
+    }
+
+    /// A scalar load (`s_load_dword*` from a table, heap, or root
+    /// descriptor):
+    /// - When used as a resource descriptor whose size words the code also
+    ///   reads as numbers, rebuilds those dimension fields from the host view.
+    /// - When read only as plain data (table/heap memory holding floats or
+    ///   scalars, or scalar loads from a root CBV/SRV), reads dwords from the
+    ///   view-heap raw SRV or root buffer.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -3944,29 +4291,41 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar memory read as data");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
+        let Some(count) = smem_dword_count(inst.name()) else {
+            return Err("a scalar memory read as data");
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
+        let spans = descriptor_spans(self.x, site);
+        let covered = |k: u32| {
+            spans
+                .iter()
+                .any(|&(_, _, first, dw)| k >= u32::from(first) && k < u32::from(first + dw))
+        };
+        let read_mask = (0..count)
+            .filter(|&k| {
+                inst.write(Reg::S(code + k as u8))
+                    .is_some_and(|v| self.data_reads.contains(&v))
+            })
+            .fold(0u32, |mask, k| mask | (1u32 << k));
+        let is_read = |k: u32| read_mask & (1u32 << k) != 0;
+        let use_at = spans
             .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
+            .find(|&&(role, ..)| role == Role::Resource)
+            .map(|&(_, at, first, _)| (at, first));
         let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+            if !(0..count).any(|k| !covered(k) && is_read(k)) {
+                return Err("a descriptor read only as data");
+            }
+            let (target, base) = self.scalar_data_source(site)?;
+            for k in 0..count {
+                if !covered(k) && is_read(k) {
+                    let x = self.load_data_dword(target, base, k);
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                } else if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals
+                        .insert(v, Val::Missing("a descriptor read only as data"));
+                }
+            }
+            return Ok(());
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -4058,13 +4417,35 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        let needs_extra = (0..count).any(|k| {
+            let rel = k.wrapping_sub(u32::from(first));
+            words.iter().all(|w| w.0 != rel) && !covered(k) && is_read(k)
+        });
+        let extra = needs_extra.then(|| self.scalar_data_source(site));
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+                None if !covered(k) && is_read(k) => match extra {
+                    Some(Ok((target, base))) => {
+                        let x = self.load_data_dword(target, base, k);
+                        self.write(inst, Reg::S(code + k as u8), x, None);
+                    }
+                    Some(Err(why)) => {
+                        if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                            self.vals.insert(v, Val::Missing(why));
+                        }
+                    }
+                    None => unreachable!(),
+                },
                 None => {
+                    let why = if covered(k) {
+                        OTHER
+                    } else {
+                        "an unread scalar load dword"
+                    };
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(why));
                     }
                 }
             }
@@ -7991,6 +8372,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            options: super::TranslateOptions::default(),
         }).unwrap();
 
         let container =
@@ -8041,7 +8423,7 @@ mod tests {
         ];
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
     }
 
@@ -8165,5 +8547,349 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    const S_MOV_S1_ZERO: u32 = 0xBE81_0380;
+
+    fn smem_load(op: u32, dst: u8, base: u8, soff: u8, offset: u32) -> [u32; 2] {
+        [
+            (0x3D << 26) | (op << 18) | (u32::from(dst) << 6) | u32::from(base >> 1),
+            (u32::from(soff) << 25) | (offset & 0x1F_FFFF),
+        ]
+    }
+
+    fn global_load(op: u32, vdst: u8, vaddr: u8, saddr: u8, offset: i16) -> [u32; 2] {
+        [
+            (0x37 << 26) | (op << 18) | (2 << 14) | ((offset as u32) & 0xFFF),
+            (u32::from(vdst) << 24) | ((u32::from(saddr) & 0x7F) << 16) | u32::from(vaddr),
+        ]
+    }
+
+    fn v_mov_b32(dst: u8, src: u32) -> u32 {
+        0x7E00_0200 | (u32::from(dst) << 17) | (src & 0x1FF)
+    }
+
+    fn exp_mrt0(v0: u8, v1: u8, v2: u8, v3: u8) -> [u32; 2] {
+        [
+            0xF800_180F,
+            u32::from(v0) | (u32::from(v1) << 8) | (u32::from(v2) << 16) | (u32::from(v3) << 24),
+        ]
+    }
+
+    fn buffer_load_dword(vdst: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+        [
+            (0x38 << 26) | (0x0C << 18) | (u32::from(byte_off) & 0xFFF),
+            (0x80 << 24) | ((u32::from(srsrc >> 2) & 0x1F) << 16) | (u32::from(vdst) << 8),
+        ]
+    }
+
+    fn lower_ps(
+        words: &[u32],
+        layout: Vec<crate::native::RootParam>,
+        used: Vec<crate::native::UsedResource>,
+        user_data: &[u32],
+    ) -> Result<(super::Lowered, Vec<super::super::bitcode::RawLoadTrace>), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout,
+            used,
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let out_sig = super::super::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let (lowered, loads) = super::lower_with_loads(
+            &Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![out_sig],
+                prims: vec![],
+                mesh_stride: 0,
+                options: super::TranslateOptions::default(),
+            },
+            user_data,
+        )?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone()).unwrap();
+        }
+        Ok((lowered, loads))
+    }
+
+    fn psv_bindings(dxil: &[u8]) -> Vec<[u32; 6]> {
+        let c = crate::Container::parse(dxil).unwrap();
+        let data = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+        let info_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let count_at = 4 + info_size;
+        let count = u32::from_le_bytes(data[count_at..count_at + 4].try_into().unwrap()) as usize;
+        if count == 0 {
+            return Vec::new();
+        }
+        let stride = u32::from_le_bytes(data[count_at + 4..count_at + 8].try_into().unwrap()) as usize;
+        let base = count_at + 8;
+        (0..count)
+            .map(|i| {
+                let s = &data[base + i * stride..base + i * stride + 24];
+                std::array::from_fn(|k| u32::from_le_bytes(s[k * 4..k * 4 + 4].try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_scalar_data_loads_become_raw_view_heap_reads() {
+        use crate::native::{RootParam, RootType};
+        use super::super::HEAP_SRV_SPACE;
+
+        let mut words = vec![S_MOV_S1_ZERO];
+        // s4 = *(table + 0x24); s3 = s2 << 4; s5 = *(table + s3); only s9, s11 read from s[8:11] at +0x40.
+        words.extend_from_slice(&smem_load(0x00, 4, 0, 125, 0x24));
+        words.push(0x8F03_8402); // s_lshl_b32 s3, s2, 4
+        words.extend_from_slice(&smem_load(0x00, 5, 0, 3, 0));
+        words.extend_from_slice(&smem_load(0x02, 8, 0, 125, 0x40));
+        words.push(v_mov_b32(0, 4));
+        words.push(v_mov_b32(1, 5));
+        words.push(v_mov_b32(2, 9));
+        words.push(v_mov_b32(3, 11));
+        words.extend_from_slice(&exp_mrt0(0, 1, 2, 3));
+        words.push(S_ENDPGM);
+
+        let layout = vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ];
+        // u0 = 0x100 (table base in s0), u2 = 2 (constant index in s2 -> s3 = 2 << 4 = 0x20).
+        let (lowered, loads) = lower_ps(&words, layout, vec![], &[0x100, 0, 2]).unwrap();
+        assert!(lowered.view_heap);
+        assert!(lowered.descriptor_tables.is_empty());
+        assert_eq!(
+            loads,
+            vec![
+                (HEAP_SRV_SPACE, 0, Some(0x124)),
+                (HEAP_SRV_SPACE, 0, Some(0x120)),
+                (HEAP_SRV_SPACE, 0, Some(0x144)),
+                (HEAP_SRV_SPACE, 0, Some(0x14c)),
+            ]
+        );
+        assert!(psv_bindings(&lowered.dxil).contains(&[4, HEAP_SRV_SPACE, 0, 0, 11, 0]));
+    }
+
+    #[test]
+    fn table_vector_global_loads_become_raw_view_heap_reads() {
+        use crate::native::{RootParam, RootType};
+        use super::super::HEAP_SRV_SPACE;
+
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+
+        let mut single = vec![S_MOV_S1_ZERO, v_mov_b32(0, 128 + 16)];
+        single.extend_from_slice(&global_load(0x0C, 1, 0, 0, 0x20));
+        single.extend_from_slice(&exp_mrt0(1, 1, 1, 1));
+        single.push(S_ENDPGM);
+        let (l1, loads1) = lower_ps(&single, layout.clone(), vec![], &[0x100]).unwrap();
+        assert!(l1.view_heap);
+        assert!(l1.descriptor_tables.is_empty());
+        assert_eq!(loads1, vec![(HEAP_SRV_SPACE, 0, Some(0x130))]);
+
+        let mut vec4 = vec![S_MOV_S1_ZERO, v_mov_b32(0, 128 + 16)];
+        vec4.extend_from_slice(&global_load(0x0E, 4, 0, 0, 0x40));
+        vec4.extend_from_slice(&exp_mrt0(4, 5, 6, 7));
+        vec4.push(S_ENDPGM);
+        let (l4, loads4) = lower_ps(&vec4, layout, vec![], &[0x100]).unwrap();
+        assert!(l4.view_heap);
+        assert!(l4.descriptor_tables.is_empty());
+        assert_eq!(
+            loads4,
+            vec![
+                (HEAP_SRV_SPACE, 0, Some(0x150)),
+                (HEAP_SRV_SPACE, 0, Some(0x154)),
+                (HEAP_SRV_SPACE, 0, Some(0x158)),
+                (HEAP_SRV_SPACE, 0, Some(0x15c)),
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_heap_data_loads_use_zero_base_raw_heap_read() {
+        use crate::native::{RootParam, RootType};
+        use super::super::HEAP_SRV_SPACE;
+
+        let mut words = vec![S_MOV_S1_ZERO];
+        words.extend_from_slice(&smem_load(0x01, 4, 0, 125, 0x20)); // s_load_dwordx2
+        words.push(v_mov_b32(0, 4));
+        words.push(v_mov_b32(1, 5));
+        words.extend_from_slice(&exp_mrt0(0, 1, 0, 1));
+        words.push(S_ENDPGM);
+
+        let layout = vec![RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let (lowered, loads) = lower_ps(&words, layout, vec![], &[]).unwrap();
+        assert!(lowered.view_heap);
+        assert!(lowered.descriptor_tables.is_empty());
+        assert!(lowered.user_data.is_empty());
+        assert_eq!(
+            loads,
+            vec![
+                (HEAP_SRV_SPACE, 0, Some(0x20)),
+                (HEAP_SRV_SPACE, 0, Some(0x24)),
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_table_splits_descriptor_and_raw_heap_user_data() {
+        use crate::native::{RootParam, RootType};
+        use super::super::HEAP_SRV_SPACE;
+
+        let mut words = vec![S_MOV_S1_ZERO];
+        // Slot 0 of table s[0:1] holds a raw buffer descriptor; slot 1 (+0x20) holds a float.
+        words.extend_from_slice(&smem_load(0x02, 4, 0, 125, 0));
+        words.extend_from_slice(&buffer_load_dword(0, 4, 0));
+        words.extend_from_slice(&smem_load(0x00, 8, 0, 125, 0x20));
+        words.push(v_mov_b32(1, 8));
+        words.extend_from_slice(&exp_mrt0(0, 1, 0, 1));
+        words.push(S_ENDPGM);
+
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        // u0 = 0x9000 (dynamic/remapped descriptor base), u1 = 0x300 (raw view-heap base).
+        let (lowered, loads) = lower_ps(&words, layout, vec![], &[0x9000, 0x300]).unwrap();
+        assert!(lowered.view_heap);
+        assert_eq!(lowered.descriptor_tables, vec![0]);
+        assert_eq!(lowered.user_data.len(), 2);
+        assert!(lowered.user_data.iter().any(|u| u.slot == 0 && u.dword == 0));
+        assert!(lowered.user_data.iter().any(|u| u.slot == 0 && u.dword == 1));
+        assert!(
+            loads.contains(&(HEAP_SRV_SPACE, 0, Some(0x320))),
+            "expected view-heap read from un-remapped dword 1 (0x300 + 0x20), got {loads:?}"
+        );
+    }
+
+    #[test]
+    fn sampler_heap_data_read_is_rejected_without_view_heap() {
+        use crate::native::{RootParam, RootType};
+
+        let mut words = vec![S_MOV_S1_ZERO];
+        words.extend_from_slice(&smem_load(0x00, 4, 0, 125, 0x10));
+        words.push(v_mov_b32(0, 4));
+        words.extend_from_slice(&exp_mrt0(0, 0, 0, 0));
+        words.push(S_ENDPGM);
+
+        let layout = vec![RootParam {
+            root: RootType::SamplerHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let Err(err) = lower_ps(&words, layout, vec![], &[]) else {
+            panic!("expected sampler heap data read to fail");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "a sampler heap read as data",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn root_descriptor_scalar_data_load_reads_root_srv() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        use super::super::ROOT_CBV_SPACE;
+
+        let mut words = Vec::new();
+        words.extend_from_slice(&smem_load(0x00, 4, 0, 125, 0x10));
+        words.push(v_mov_b32(0, 4));
+        words.extend_from_slice(&exp_mrt0(0, 0, 0, 0));
+        words.push(S_ENDPGM);
+
+        let layout = vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 3,
+        }];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            user_data: 0,
+            slot: 3,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            dwords: 4,
+            stride: 0,
+        }];
+        let (lowered, loads) = lower_ps(&words, layout, used, &[]).unwrap();
+        assert!(!lowered.view_heap);
+        assert!(lowered.descriptor_tables.is_empty());
+        assert_eq!(lowered.root_srvs, vec![3]);
+        assert_eq!(loads, vec![(ROOT_CBV_SPACE, 3, Some(0x10))]);
     }
 }

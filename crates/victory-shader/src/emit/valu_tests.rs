@@ -148,6 +148,8 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        view_heap: lowered.view_heap,
+        descriptor_tables: lowered.descriptor_tables,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

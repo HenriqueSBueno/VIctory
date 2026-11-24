@@ -1009,6 +1009,118 @@ impl Writer {
 }
 
 #[cfg(test)]
+pub(crate) type RawLoadTrace = (u32, u32, Option<u64>);
+
+#[cfg(test)]
+impl Module {
+    /// Inspects every live `dx.op.rawBufferLoad.f32` in block order, returning
+    /// `(space, register, byte_offset)` evaluated symbolically against `user_data`.
+    pub(crate) fn raw_buffer_loads(&self, user_data: &[u32]) -> Vec<RawLoadTrace> {
+        let eval_const_int = |v: V| -> Option<i64> {
+            match v {
+                V::Const(id) => match self.consts[id as usize].1 {
+                    Const::Int(n) => Some(n),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let eval_handle = |mut v: V| -> Option<(u32, u32)> {
+            loop {
+                let V::Inst(i) = v else { return None };
+                let Op::Call(f, ref args) = self.insts[i as usize].op else {
+                    return None;
+                };
+                let name = self.funcs[f as usize].name.as_str();
+                if name.ends_with("annotateHandle") {
+                    v = *args.get(1)?;
+                } else if name.ends_with("createHandleFromBinding") {
+                    let V::Const(c) = *args.get(1)? else {
+                        return None;
+                    };
+                    let Const::Aggregate(ref fields) = self.consts[c as usize].1 else {
+                        return None;
+                    };
+                    let reg = eval_const_int(V::Const(*fields.first()?))? as u32;
+                    let space = eval_const_int(V::Const(*fields.get(2)?))? as u32;
+                    return Some((space, reg));
+                } else {
+                    return None;
+                }
+            }
+        };
+        fn eval_int(
+            m: &Module,
+            user_data: &[u32],
+            eval_handle: &dyn Fn(V) -> Option<(u32, u32)>,
+            v: V,
+        ) -> Option<u64> {
+            match v {
+                V::Const(id) => match m.consts[id as usize].1 {
+                    Const::Int(n) => Some(n as u64),
+                    _ => None,
+                },
+                V::Inst(i) => match &m.insts[i as usize].op {
+                    Op::Bin(op, a, b) => {
+                        let (x, y) = eval_int(m, user_data, eval_handle, *a)
+                            .zip(eval_int(m, user_data, eval_handle, *b))?;
+                        Some(match op {
+                            Bin::Add => x.wrapping_add(y),
+                            Bin::Sub => x.wrapping_sub(y),
+                            Bin::Mul => x.wrapping_mul(y),
+                            Bin::Shl => x.wrapping_shl((y & 31) as u32),
+                            Bin::LShr => ((x as u32).wrapping_shr((y & 31) as u32)) as u64,
+                            Bin::AShr => ((x as i32).wrapping_shr((y & 31) as u32)) as i64 as u64,
+                            Bin::And => x & y,
+                            Bin::Or => x | y,
+                            Bin::Xor => x ^ y,
+                            _ => return None,
+                        })
+                    }
+                    Op::Cast(Cast::Bitcast | Cast::ZExt | Cast::Trunc, x) => {
+                        eval_int(m, user_data, eval_handle, *x)
+                    }
+                    Op::Extract(agg, col) => {
+                        let V::Inst(ci) = *agg else { return None };
+                        let Op::Call(f, ref args) = m.insts[ci as usize].op else {
+                            return None;
+                        };
+                        if !m.funcs[f as usize].name.contains("cbufferLoadLegacy") {
+                            return None;
+                        }
+                        if eval_handle(*args.get(1)?) != Some((super::shader::USER_DATA_SPACE, 0)) {
+                            return None;
+                        }
+                        let row = eval_int(m, user_data, eval_handle, *args.get(2)?)? as usize;
+                        user_data.get(row * 4 + *col as usize).map(|&w| u64::from(w))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
+        let live = self.live();
+        let mut out = Vec::new();
+        for b in &self.blocks {
+            for &id in &b.body {
+                if !live[id as usize] {
+                    continue;
+                }
+                if let Op::Call(f, ref args) = self.insts[id as usize].op
+                    && self.funcs[f as usize].name == "dx.op.rawBufferLoad.f32"
+                    && let Some((space, reg)) = eval_handle(args[1])
+                {
+                    let off = eval_int(self, user_data, &eval_handle, args[2]);
+                    out.push((space, reg, off));
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
