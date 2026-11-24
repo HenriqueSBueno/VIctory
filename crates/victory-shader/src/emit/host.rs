@@ -177,26 +177,37 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<(u32, u32, i32)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s
+                    .root_cbvs
+                    .iter()
+                    .map(|&r| (super::ROOT_CBV_SPACE, u32::from(r), D3D12_ROOT_PARAMETER_TYPE_CBV.0));
+                let srvs = s
+                    .root_srvs
+                    .iter()
+                    .map(|&r| (super::ROOT_CBV_SPACE, u32::from(r), D3D12_ROOT_PARAMETER_TYPE_SRV.0));
+                let uavs = s
+                    .root_uavs
+                    .iter()
+                    .map(|&r| (super::ROOT_CBV_SPACE, u32::from(r), D3D12_ROOT_PARAMETER_TYPE_UAV.0));
+                let csrvs = (0..s.const_srvs.len())
+                    .map(|r| (super::CONST_VIEW_SPACE, r as u32, D3D12_ROOT_PARAMETER_TYPE_SRV.0));
+                let cuavs = (0..s.const_uavs.len())
+                    .map(|r| (super::CONST_VIEW_SPACE, r as u32, D3D12_ROOT_PARAMETER_TYPE_UAV.0));
+                cbvs.chain(srvs).chain(uavs).chain(csrvs).chain(cuavs)
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (space, slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                },
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE(kind),
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                        ShaderRegister: u32::from(slot),
-                        RegisterSpace: super::ROOT_CBV_SPACE,
+                        ShaderRegister: slot,
+                        RegisterSpace: space,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -586,6 +597,9 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        const_srvs: Vec::new(),
+        const_uavs: Vec::new(),
         view_heap: false,
         descriptor_tables: Vec::new(),
     }
@@ -601,11 +615,13 @@ pub enum Root {
         index: usize,
     },
     /// A root CBV (or with `srv`, a root SRV) over a buffer of these
-    /// dwords ([`Host::dispatch`] only).
+    /// dwords.
     View {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over a buffer of these dwords.
+    Uav(Vec<u32>),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -864,6 +880,42 @@ impl Host {
                         } else {
                             list.SetGraphicsRootConstantBufferView(*param, va);
                         }
+                        keep.push(b);
+                    }
+                    Root::Uav(data) => {
+                        let bytes = (data.len() * 4).next_multiple_of(256).max(256) as u64;
+                        let mut desc = buf_desc(bytes);
+                        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                        )?;
+                        if !data.is_empty() {
+                            let up = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buf_desc(bytes),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                                None,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            up.Map(0, None, Some(&mut p)).map_err(err)?;
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr().cast::<u8>(),
+                                p.cast::<u8>(),
+                                data.len() * 4,
+                            );
+                            up.Unmap(0, None);
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(up);
+                        }
+                        list.SetGraphicsRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
                         keep.push(b);
                     }
                 }
@@ -1400,6 +1452,26 @@ impl Host {
                         }
                         keep.push(b);
                     }
+                    Root::Uav(data) => {
+                        let bytes = (data.len() * 4).next_multiple_of(256).max(256) as u64;
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )?;
+                        if !data.is_empty() {
+                            let up = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(up);
+                        }
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        keep.push(b);
+                    }
                 }
             }
             let [x, y, z] = d.groups;
@@ -1481,6 +1553,9 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
             view_heap: false,
             descriptor_tables: Vec::new(),
         }

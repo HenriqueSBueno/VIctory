@@ -150,19 +150,66 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootViewKind {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+fn constant_address(roots: &[Root], slot: u8, dword: u32) -> Option<u64> {
+    let Some(Root::Constants(c)) = roots.get(usize::from(slot)) else {
+        return None;
+    };
+    let lo = *c.get(dword as usize)?;
+    let hi = *c.get(dword as usize + 1)?;
+    Some(u64::from(lo) | (u64::from(hi) << 32))
+}
+
+/// Host memory for a root CBV, SRV, or UAV over title address `address`,
+/// copying recent CPU writes to the shadow buffer and recording GPU UAV writes
+/// for readback.
+fn root_view(list: &HostList, address: u64, kind: RootViewKind) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = shadow.left(address).min(match kind {
+        RootViewKind::Cbv => 1 << 16,
+        RootViewKind::Srv | RootViewKind::Uav => 1 << 20,
+    });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
-        return Some(gpu);
+    match kind {
+        RootViewKind::Cbv => {
+            if gpu.is_multiple_of(256) {
+                shadow.refresh(list, address, len);
+                return Some(gpu);
+            }
+            let (gpu, to) = list.scratch(len)?;
+            list.defer_fill(to, address as *const u8, len as usize);
+            Some(gpu)
+        }
+        RootViewKind::Srv => {
+            shadow.refresh(list, address, len);
+            Some(gpu)
+        }
+        RootViewKind::Uav => {
+            if !gpu.is_multiple_of(4) {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "an unaligned root UAV is skipped"
+                );
+                return None;
+            }
+            shadow.refresh(list, address, len);
+            shadow.gpu_writes(list, address, len);
+            Some(gpu)
+        }
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
 }
 
 /// Root table slots that hold descriptors (excluding tables read only as raw data).
@@ -194,13 +241,6 @@ fn resolve_user_dword(
     } else {
         original()
     }
-}
-
-macro_rules! once {
-    ($($arg:tt)*) => {{
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!($($arg)*));
-    }};
 }
 
 /// Host GPU address of the bound view descriptor heap's shadow SRV,
@@ -591,35 +631,39 @@ impl State {
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, RootViewKind::Cbv),
+                (&stage.root_srvs, RootViewKind::Srv),
+                (&stage.root_uavs, RootViewKind::Uav),
+            ] {
                 for &(slot, param) in views {
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
-                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        // An unset table is undefined: a null view instead.
-                        if tabled && !self.root_srv_table(list, None, param, compute) {
-                            return false;
+                    let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                        Some(&Root::View(a)) => Some(a),
+                        _ => {
+                            once!(slot, "a shader reads a root view the title did not set");
+                            None
                         }
-                        continue;
                     };
-                    if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute) {
-                            return false;
-                        }
-                        continue;
+                    if !self.bind_address_view(list, address, kind, param, compute) {
+                        return false;
                     }
-                    let Some(gpu) = root_view(list, address, srv) else {
-                        continue;
-                    };
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
+                }
+            }
+            for (views, kind) in [
+                (&stage.const_srvs, RootViewKind::Srv),
+                (&stage.const_uavs, RootViewKind::Uav),
+            ] {
+                for &(slot, dword, param) in views {
+                    let address = constant_address(self.roots_ref(compute), slot, dword);
+                    if address.is_none() {
+                        once!(
+                            slot,
+                            dword,
+                            "a shader reads a constant address the title did not set"
+                        );
+                    }
+                    if !self.bind_address_view(list, address, kind, param, compute) {
+                        return false;
                     }
                 }
             }
@@ -635,6 +679,44 @@ impl State {
                 } else {
                     l.SetGraphicsRootShaderResourceView(param, gpu);
                 }
+            }
+        }
+        true
+    }
+
+    /// Binds one root descriptor (CBV/SRV/UAV) or bounded SRV table for `address`.
+    fn bind_address_view(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        kind: RootViewKind,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let tabled = kind == RootViewKind::Srv && crate::pipeline::host::bounded_root_srvs();
+        let Some(address) = address else {
+            // An unset table is undefined: bind a null view.
+            if tabled && !self.root_srv_table(list, None, param, compute) {
+                return false;
+            }
+            return true;
+        };
+        if tabled {
+            return self.root_srv_table(list, Some(address), param, compute);
+        }
+        let Some(gpu) = root_view(list, address, kind) else {
+            return true;
+        };
+        let l = &list.list;
+        // SAFETY: an open list; the address is in live memory.
+        unsafe {
+            match (compute, kind) {
+                (false, RootViewKind::Cbv) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, RootViewKind::Srv) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (false, RootViewKind::Uav) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                (true, RootViewKind::Cbv) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, RootViewKind::Srv) => l.SetComputeRootShaderResourceView(param, gpu),
+                (true, RootViewKind::Uav) => l.SetComputeRootUnorderedAccessView(param, gpu),
             }
         }
         true
@@ -785,11 +867,23 @@ impl State {
                     }
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                }
+            }
+            for &(slot, dword, _) in stage.const_srvs.iter().chain(&stage.const_uavs) {
+                if let Some(address) = constant_address(self.roots_ref(compute), slot, dword) {
+                    let host = crate::shadow::find(address, 1)
+                        .map(|s| (s.gpu(address), s.left(address)));
+                    let _ = write!(text, " const{slot}[{dword}]={address:#x} host {host:#x?}");
                 }
             }
         }
@@ -1740,5 +1834,19 @@ mod tests {
         assert_eq!(resolve_user_dword(&desc_ud, &made, || 0x80), 0x200);
         assert_eq!(resolve_user_dword(&raw_mixed_ud, &made, || 0x80), 0x80);
         assert_eq!(resolve_user_dword(&data_only_ud, &made, || 0x140), 0x140);
+    }
+
+    #[test]
+    fn constant_address_reads_consecutive_dwords() {
+        let roots = [
+            Root::None,
+            Root::View(0x1000),
+            Root::Constants(vec![0x4567_89AB, 0x0000_0123, 0xBA98_7654, 0x0000_FEDC]),
+        ];
+        assert_eq!(constant_address(&roots, 2, 0), Some(0x0000_0123_4567_89AB));
+        assert_eq!(constant_address(&roots, 2, 2), Some(0x0000_FEDC_BA98_7654));
+        assert_eq!(constant_address(&roots, 2, 3), None);
+        assert_eq!(constant_address(&roots, 1, 0), None);
+        assert_eq!(constant_address(&roots, 0, 0), None);
     }
 }

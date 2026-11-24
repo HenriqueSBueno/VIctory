@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{HEAP_SRV_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    CONST_VIEW_SPACE, HEAP_SRV_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -262,6 +264,69 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// `(slot, first_dword, root_param)` for constant-pair SRVs in [`CONST_VIEW_SPACE`].
+    pub(crate) const_srvs: Vec<(u8, u32, u32)>,
+    /// `(slot, first_dword, root_param)` for constant-pair UAVs in [`CONST_VIEW_SPACE`].
+    pub(crate) const_uavs: Vec<(u8, u32, u32)>,
+}
+
+fn stage_views_cost(t: &victory_shader::emit::HostShader) -> u32 {
+    2 * (t.root_cbvs.len()
+        + t.root_srvs.len()
+        + t.root_uavs.len()
+        + t.const_srvs.len()
+        + t.const_uavs.len()) as u32
+}
+
+// `Box` keeps each range's heap address valid for `pDescriptorRanges` when `ranges` reallocates.
+#[allow(clippy::vec_box)]
+fn push_root_view(
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    register: u32,
+    space: u32,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> Option<u32> {
+    let param = params.len() as u32;
+    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+        // A one-view table: the view's size bounds the reads,
+        // which a root descriptor leaves unbounded.
+        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: register,
+            RegisterSpace: space,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        }));
+        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+        return Some(param);
+    }
+    params.push(D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: register,
+                RegisterSpace: space,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    });
+    Some(param)
 }
 
 /// D3D12 root signatures hold at most 64 DWORDs (`Constants` take `dwords`,
@@ -380,10 +445,7 @@ impl HostPipeline {
             .any(|(s, _)| s.translated().is_some_and(|t| t.host.view_heap));
         let views_cost: u32 = stages
             .iter()
-            .filter_map(|&(s, _)| {
-                let t = &s.translated()?.host;
-                Some(2 * (t.root_cbvs.len() + t.root_srvs.len()) as u32)
-            })
+            .filter_map(|&(s, _)| Some(stage_views_cost(&s.translated()?.host)))
             .sum::<u32>()
             + if has_view_heap { 2 } else { 0 };
         let use_cbv = cbv_user_data_stages(&stage_dwords, views_cost);
@@ -402,6 +464,9 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                const_srvs: Vec::new(),
+                const_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -444,46 +509,46 @@ impl HostPipeline {
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
+                ),
             ] {
                 for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
-                        // A one-view table: the view's size bounds the reads,
-                        // which a root descriptor leaves unbounded.
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                        out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
-                        });
-                        continue;
-                    }
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
+                    let param = push_root_view(
+                        &mut params,
+                        &mut ranges,
+                        kind,
+                        u32::from(slot),
+                        ROOT_CBV_SPACE,
+                        visibility,
+                    )?;
+                    out.push((slot, param));
+                }
+            }
+            for (pairs, kind, out) in [
+                (
+                    &t.const_srvs,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    &mut stage.const_srvs,
+                ),
+                (
+                    &t.const_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.const_uavs,
+                ),
+            ] {
+                for (reg, &(slot, dword)) in pairs.iter().enumerate() {
+                    let param = push_root_view(
+                        &mut params,
+                        &mut ranges,
+                        kind,
+                        reg as u32,
+                        CONST_VIEW_SPACE,
+                        visibility,
+                    )?;
+                    out.push((slot, dword, param));
                 }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
@@ -805,5 +870,24 @@ mod tests {
         assert_eq!(cbv_user_data_stages(&[68], 0), vec![true]);
         assert_eq!(cbv_user_data_stages(&[36, 36], 0), vec![false, true]);
         assert_eq!(cbv_user_data_stages(&[60, 4], 4), vec![true, false]);
+    }
+
+    #[test]
+    fn stage_views_cost_counts_root_uavs_and_constant_views() {
+        let t = victory_shader::emit::HostShader {
+            stage: victory_shader::HwStage::Cs,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: vec![0],
+            root_srvs: vec![1],
+            root_uavs: vec![2, 3],
+            const_srvs: vec![(4, 0)],
+            const_uavs: vec![(4, 2), (4, 4)],
+            view_heap: false,
+            descriptor_tables: Vec::new(),
+        };
+        assert_eq!(stage_views_cost(&t), 14);
     }
 }

@@ -26,6 +26,9 @@ pub type Site = (usize, usize);
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// First dword within the parameter (0 except for a 64-bit address in
+    /// `RootType::Constants`).
+    pub dword: u32,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
     pub offset: u32,
@@ -524,6 +527,40 @@ impl<'a> Tracer<'a> {
         ))
     }
 
+    fn add_terms(&self, v: Value) -> Option<[Term; 2]> {
+        self.sop2(v, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(v))
+    }
+
+    /// Operands of `s_addc_u32` or `v_add_co_ci_u32` writing `v`.
+    fn carry_add(&self, v: Value) -> Option<[Term; 2]> {
+        if let Some((_, t)) = self.sop2(v, &["s_addc_u32"]) {
+            return Some(t);
+        }
+        let inst = self.def(v)?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if inst.name() != "v_add_co_ci_u32"
+            || f.dst.is_none_or(|d| !matches!(d, Operand::Vector { .. }))
+            || inst.write(Reg::V(match f.dst? {
+                Operand::Vector { reg, .. } => reg,
+                _ => return None,
+            })) != Some(v)
+            || f.abs != 0
+            || f.neg != 0
+            || f.sdwa.is_some()
+            || f.dpp.is_some()
+        {
+            return None;
+        }
+        Some([
+            self.vterm(inst, f.src.first()?)?,
+            self.vterm(inst, f.src.get(1)?)?,
+        ])
+    }
+
     fn sum(&self, t: Term) -> Sum {
         let v = match t {
             Term::Const(c) => {
@@ -540,7 +577,9 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some((_, 0)) = self.param_value(v) {
+        if let Some((param, 0)) = self.param_value(v)
+            && is_address_root(self.layout[param].root)
+        {
             return Sum {
                 base: Some(v),
                 offset: 0,
@@ -557,11 +596,7 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
-        let Some([a, b]) = self
-            .sop2(v, &["s_add_u32", "s_add_i32"])
-            .map(|(_, t)| t)
-            .or_else(|| self.vadd(v))
-        else {
+        let Some([a, b]) = self.add_terms(v) else {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
@@ -681,10 +716,28 @@ impl<'a> Tracer<'a> {
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
+        let Some(base) = s.base else {
+            if let Some((param, dword, rest)) =
+                self.split_const_base(lo, hi, extra.dynamic.is_some())
+            {
+                if rest.dynamic.is_some() && extra.dynamic.is_some() {
+                    return Err("an address with two computed terms");
+                }
+                return Ok(Address {
+                    param,
+                    dword,
+                    offset: rest.offset.wrapping_add(extra.offset),
+                    dynamic: rest.dynamic.or(extra.dynamic),
+                });
+            }
+            if s.dynamic.is_some() && extra.dynamic.is_some() {
+                return Err("an address with two computed terms");
+            }
+            return Err(self.why_no_base(s.dynamic));
+        };
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
@@ -695,6 +748,7 @@ impl<'a> Tracer<'a> {
             }
             return Ok(Address {
                 param: CODE,
+                dword: 0,
                 offset: (pc.machine.offset as u32 + 4)
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
@@ -723,26 +777,73 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        let is_high_term = |t: Term| self.is_param_high(t, descriptor.then_some(param));
-        let is_high_val = |v: Value| descriptor && self.is_param_high(Term::Value(v), Some(param));
-        if !self.high_half(hi, &is_high_term)
-            && !(dynamic.is_some() && self.carried(hi, &is_high_val))
-        {
+        if !self.matches_high(hi, descriptor.then_some((param, 1)), dynamic.is_some()) {
             return Err("an address with an untracked high half");
         }
         Ok(Address {
             param,
+            dword: 0,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic,
         })
     }
 
-    fn is_param_high(&self, t: Term, param: Option<usize>) -> bool {
+    /// Resolves `t` as a 64-bit address in `RootType::Constants` `(param, dword)`
+    /// paired with `(param, dword + 1)` in `hi`, plus remaining offset/dynamic terms.
+    fn split_const_base(
+        &self,
+        t: Term,
+        hi: Term,
+        extra_dyn: bool,
+    ) -> Option<(usize, u32, Sum)> {
+        let Term::Value(v) = t else { return None };
+        if let Some((param, dword)) = self.param_value(v)
+            && self.layout[param].root == RootType::Constants
+            && dword + 1 < self.layout[param].sgprs
+            && self.matches_high(hi, Some((param, dword + 1)), extra_dyn)
+        {
+            return Some((
+                param,
+                dword,
+                Sum {
+                    base: None,
+                    offset: 0,
+                    dynamic: None,
+                },
+            ));
+        }
+        let [a, b] = self.add_terms(v)?;
+        for (cand, rest) in [(a, b), (b, a)] {
+            let other = self.sum(rest);
+            if other.base.is_some() {
+                continue;
+            }
+            if let Some((param, dword, mut inner)) =
+                self.split_const_base(cand, hi, extra_dyn || other.dynamic.is_some())
+            {
+                if inner.dynamic.is_some() && other.dynamic.is_some() {
+                    continue;
+                }
+                inner.offset = inner.offset.wrapping_add(other.offset);
+                inner.dynamic = inner.dynamic.or(other.dynamic);
+                return Some((param, dword, inner));
+            }
+        }
+        None
+    }
+
+    fn matches_high(&self, hi: Term, high_param: Option<(usize, u32)>, has_dynamic: bool) -> bool {
+        let is_high_term = |t: Term| self.is_param_high(t, high_param);
+        let is_high_val = |v: Value| high_param.is_some() && self.is_param_high(Term::Value(v), high_param);
+        self.high_half(hi, &is_high_term) || (has_dynamic && self.carried(hi, &is_high_val))
+    }
+
+    fn is_param_high(&self, t: Term, param: Option<(usize, u32)>) -> bool {
         match (param, t) {
             (None, Term::Const(0)) => true,
-            (Some(p), Term::Value(v)) => {
-                self.param_value(v) == Some((p, 1))
-                    || matches!(self.strip_hi_mask(v), Some(x) if self.is_param_high(x, Some(p)))
+            (Some((p, d)), Term::Value(v)) => {
+                self.param_value(v) == Some((p, d))
+                    || matches!(self.strip_hi_mask(v), Some(x) if self.is_param_high(x, Some((p, d))))
             }
             _ => false,
         }
@@ -751,8 +852,8 @@ impl<'a> Tracer<'a> {
     /// `hi` satisfies `want` (0 for a table, high half for descriptor/code), possibly plus a carry.
     fn high_half(&self, hi: Term, want: &dyn Fn(Term) -> bool) -> bool {
         want(hi)
-            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| want(a) && b == Term::Const(0) || want(b) && a == Term::Const(0)
+            || matches!(hi, Term::Value(v) if self.carry_add(v).is_some_and(
+                |[a, b]| want(a) && b == Term::Const(0) || want(b) && a == Term::Const(0)
             ))
     }
 
@@ -763,25 +864,22 @@ impl<'a> Tracer<'a> {
         if want(v) {
             return true;
         }
-        if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
+        if let Some([a, b]) = self.carry_add(v) {
             return self.carried(a, want) || self.carried(b, want);
         }
-        let Some(inst) = self.def(v) else {
-            return false;
-        };
-        let Fields::Valu(f) = &inst.fields else {
-            return false;
-        };
-        inst.name() == "v_add_co_ci_u32"
-            && f.src[..2.min(f.src.len())]
-                .iter()
-                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, want)))
+        false
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
         let Some(v) = dynamic else {
             return "a constant address";
         };
+        if self
+            .leaves(v)
+            .any(|l| self.param_value(l).is_some_and(|(p, _)| !is_address_root(self.layout[p].root)))
+        {
+            return "an address from a root parameter that is no address";
+        }
         if self.inputs[v.0 as usize].is_some() {
             return "an address in an SGPR that is no root parameter";
         }
@@ -800,8 +898,8 @@ impl<'a> Tracer<'a> {
 
     /// The terms of the additions that compute `v`.
     fn leaves(&self, v: Value) -> Box<dyn Iterator<Item = Value> + '_> {
-        match self.sop2(v, &["s_add_u32", "s_add_i32"]) {
-            Some((_, terms)) => Box::new(terms.into_iter().flat_map(move |t| match t {
+        match self.add_terms(v) {
+            Some(terms) => Box::new(terms.into_iter().flat_map(move |t| match t {
                 Term::Value(x) => self.leaves(x),
                 Term::Const(_) => Box::new(std::iter::empty()),
             })),
@@ -1152,6 +1250,16 @@ fn user_sgpr_limit(stage: HwStage) -> u32 {
     if matches!(stage, HwStage::Cs) { 16 } else { 32 }
 }
 
+fn is_address_root(root: RootType) -> bool {
+    matches!(
+        root,
+        RootType::Table
+            | RootType::ResourceHeap
+            | RootType::SamplerHeap
+            | RootType::Descriptor
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,6 +1286,7 @@ mod tests {
     fn at(param: usize, offset: u32) -> Address {
         Address {
             param,
+            dword: 0,
             offset,
             dynamic: None,
         }
@@ -1510,6 +1619,215 @@ mod tests {
             ShaderError::Unsupported {
                 offset: 12,
                 what: "an address in an SGPR that is no root parameter",
+            }
+        );
+    }
+
+    fn mubuf(op: u32, offset: u16, srsrc: u8, vdata: u8, vaddr: u8) -> [u32; 2] {
+        [
+            (0x38 << 26) | (op << 18) | (u32::from(offset) & 0xFFF),
+            (0x80 << 24)
+                | ((u32::from(srsrc >> 2) & 0x1F) << 16)
+                | (u32::from(vdata) << 8)
+                | u32::from(vaddr),
+        ]
+    }
+
+    fn s_mov_b32_imm(dst: u8, imm: u32) -> [u32; 2] {
+        [0xBE80_03FF | (u32::from(dst) << 16), imm]
+    }
+
+    fn s_or_b32_imm(dst: u8, src: u8, imm: u32) -> [u32; 2] {
+        [0x8800_FF00 | (u32::from(dst) << 16) | u32::from(src), imm]
+    }
+
+    fn s_add_u32_imm(dst: u8, src: u8, imm: u32) -> [u32; 2] {
+        [0x8000_FF00 | (u32::from(dst) << 16) | u32::from(src), imm]
+    }
+
+    fn s_add_u32_s(dst: u8, src0: u8, src1: u8) -> u32 {
+        0x8000_0000 | (u32::from(dst) << 16) | (u32::from(src1) << 8) | u32::from(src0)
+    }
+
+    fn s_addc_u32_zero(dst: u8, src0: u8) -> u32 {
+        0x8200_8000 | (u32::from(dst) << 16) | u32::from(src0)
+    }
+
+    #[test]
+    fn spilled_root_uav_descriptor_tracks_stores_loads_and_scalar_reads() {
+        let mut words = Vec::new();
+        words.extend_from_slice(&s_and_b32_imm(3, 1, 0xff));
+        words.push(s_mov_b32_s(2, 0));
+        // s_load_dwordx2 s[0:1], s[2:3], 0x08 -> user_data 18..19 (Descriptor, param 1)
+        words.extend_from_slice(&smem_load(1, 0, 2, 125, 0x08));
+        words.extend_from_slice(&s_or_b32_imm(1, 1, 0x0010_0000));
+        words.push(0xBE82_03C1); // s_mov_b32 s2, -1
+        words.extend_from_slice(&s_mov_b32_imm(3, 0x1101_4FAC));
+        words.extend_from_slice(&[0xF420_0100, 0xFA00_0000]); // s_buffer_load_dword s4, s[0:3], null
+        words.extend_from_slice(&mubuf(0x1C, 16, 0, 0, 0)); // buffer_store_dword
+        words.extend_from_slice(&mubuf(0x0C, 4, 0, 1, 0)); // buffer_load_dword
+        words.push(S_ENDPGM);
+
+        let layout = [
+            param(Descriptor, 16, 2),
+            param(Descriptor, 18, 2),
+            param(Constants, 20, 16),
+        ];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert_eq!(r.spill_loads, [(0, 2)]);
+        assert_eq!(r.descriptors.len(), 3);
+        for d in &r.descriptors {
+            assert_eq!(
+                d.source,
+                Source::Built {
+                    address: at(1, 0),
+                    bits: 0x0010_0000,
+                    words: [u32::MAX, 0x1101_4FAC],
+                }
+            );
+        }
+        assert!(r.params.iter().any(|&(_, p, dw)| p == 1 && dw == 0));
+        assert!(r.params.iter().any(|&(_, p, dw)| p == 1 && dw == 1));
+    }
+
+    #[test]
+    fn constants_64bit_addresses_resolve_direct_spilled_and_arithmetic() {
+        // Direct Constants (ud 0..4, param 0):
+        // - dwords (2, 3) masked with s_and_b32 0xffff and built into a V#.
+        // - dwords (0, 1) with scalar s_add_u32/s_addc_u32 +0x20 loaded via smem.
+        // - dwords (0, 1) with vector v_add_co_u32/v_add_co_ci_u32 loaded via global_load_dword.
+        let mut words = Vec::new();
+        words.push(s_mov_b32_s(4, 2));
+        words.extend_from_slice(&s_and_b32_imm(5, 3, 0xffff));
+        words.extend_from_slice(&s_or_b32_imm(5, 5, 0x0010_0000));
+        words.push(0xBE86_03C1); // s_mov_b32 s6, -1
+        words.extend_from_slice(&s_mov_b32_imm(7, 0x1101_4FAC));
+        words.extend_from_slice(&mubuf(0x0C, 0, 4, 0, 0));
+        words.extend_from_slice(&s_add_u32_imm(8, 0, 0x20));
+        words.push(s_addc_u32_zero(9, 1));
+        words.extend_from_slice(&smem_load(0, 10, 8, 125, 0));
+        // Vector 64-bit carry: v_mov_b32 v1, 0; v_add_co_u32 v0, vcc, s0, v4; v_add_co_ci_u32 v1, vcc, s1, v1, vcc
+        words.push(0x7E02_0280);
+        words.extend_from_slice(&[
+            (0x35 << 26) | (0x30F << 16) | (106 << 8),
+            (256 + 4) << 9, // s0 + v4
+        ]);
+        words.push((0x28 << 25) | (1 << 17) | (1 << 9) | 1);
+        words.extend_from_slice(&[
+            (0x37 << 26) | (0x0C << 18) | (2 << 14) | 16,
+            (3 << 24) | (125 << 16), // global_load_dword v3, v[0:1], off offset:16
+        ]);
+        words.push(S_ENDPGM);
+
+        let r = track_words(&words, &[param(Constants, 0, 4)], HwStage::Cs);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: Address {
+                    param: 0,
+                    dword: 2,
+                    offset: 0,
+                    dynamic: None,
+                },
+                bits: 0x0010_0000,
+                words: [u32::MAX, 0x1101_4FAC],
+            }
+        );
+        assert_eq!(
+            r.scalar[0].1,
+            Address {
+                param: 0,
+                dword: 0,
+                offset: 0x20,
+                dynamic: None,
+            }
+        );
+        assert_eq!(r.scalar[1].1.param, 0);
+        assert_eq!(r.scalar[1].1.dword, 0);
+        assert_eq!(r.scalar[1].1.offset, 16);
+        assert!(r.scalar[1].1.dynamic.is_some());
+
+        // Spilled Constants (ud 20, param 2): read dwords (2, 3) at spill offset 0x18.
+        let mut spilled = Vec::new();
+        spilled.extend_from_slice(&s_and_b32_imm(3, 1, 0xff));
+        spilled.push(s_mov_b32_s(2, 0));
+        spilled.extend_from_slice(&smem_load(1, 4, 2, 125, 0x18));
+        spilled.push(0xBE86_03C1); // s_mov_b32 s6, -1
+        spilled.extend_from_slice(&s_mov_b32_imm(7, 0x1101_4FAC));
+        spilled.extend_from_slice(&mubuf(0x1C, 0, 4, 0, 0));
+        spilled.push(S_ENDPGM);
+        let rs = track_words(
+            &spilled,
+            &[
+                param(Descriptor, 16, 2),
+                param(Descriptor, 18, 2),
+                param(Constants, 20, 8),
+            ],
+            HwStage::Cs,
+        );
+        assert_eq!(
+            rs.descriptors[0].source,
+            Source::Built {
+                address: Address {
+                    param: 2,
+                    dword: 2,
+                    offset: 0,
+                    dynamic: None,
+                },
+                bits: 0,
+                words: [u32::MAX, 0x1101_4FAC],
+            }
+        );
+    }
+
+    #[test]
+    fn constants_dword0_offsets_address_roots_and_invalid_non_address_fails() {
+        // Table base in s0 (hi zeroed in s1) + Constants dword 0 in s2:
+        // Constants dword 0 must act as dynamic offset, not a base address.
+        let mut words = Vec::new();
+        words.push(0xBE81_0380); // s_mov_b32 s1, 0
+        words.push(s_add_u32_s(4, 0, 2));
+        words.push(s_addc_u32_zero(5, 1));
+        words.extend_from_slice(&smem_load(2, 8, 4, 125, 0));
+        words.push(S_ENDPGM);
+
+        let r = track_words(
+            &words,
+            &[param(Table, 0, 1), param(Constants, 2, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.dword, a.offset), (0, 0, 0));
+        assert!(a.dynamic.is_some());
+
+        // Single-dword Constant + 0 (not a 64-bit consecutive pair) still fails
+        // with "an address from a root parameter that is no address".
+        let track_err = |words: &[u32], layout: &[RootParam]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, layout, HwStage::Cs).unwrap_err()
+        };
+        let mut bad = vec![0xBE81_0380]; // s_mov_b32 s1, 0
+        bad.extend_from_slice(&smem_load(0, 4, 0, 125, 0));
+        bad.push(S_ENDPGM);
+        assert_eq!(
+            track_err(&bad, &[param(Constants, 0, 2)]),
+            ShaderError::Unsupported {
+                offset: 4,
+                what: "an address from a root parameter that is no address",
+            }
+        );
+
+        // Non-consecutive Constant dwords (s0, s2) also fail cleanly.
+        let mut non_adj = vec![s_mov_b32_s(4, 0), s_mov_b32_s(5, 2)];
+        non_adj.extend_from_slice(&smem_load(0, 8, 4, 125, 0));
+        non_adj.push(S_ENDPGM);
+        assert_eq!(
+            track_err(&non_adj, &[param(Constants, 0, 4)]),
+            ShaderError::Unsupported {
+                offset: 8,
+                what: "an address from a root parameter that is no address",
             }
         );
     }

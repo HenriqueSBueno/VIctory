@@ -25,10 +25,13 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs, SRVs and UAVs** (raw buffers) as root descriptors
+//!   `b<i>` / `t<i>` / `u<i>` in [`ROOT_CBV_SPACE`], `i` the title's root
+//!   parameter index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`],
+//!   [`HostShader::root_uavs`]); the address the title sets is the buffer's.
+//!   64-bit GPU addresses carried in consecutive `RootType::Constants`
+//!   dwords bind as raw root views in [`CONST_VIEW_SPACE`] (`t<n>` in
+//!   [`HostShader::const_srvs`], `u<n>` in [`HostShader::const_uavs`]).
 //! * **View-heap data reads**: shaders that read descriptor-table or
 //!   resource-heap memory as plain numeric data (scalar `s_load_dword*` or
 //!   vector `global_load_*` loads at table/heap base + offset) read a raw
@@ -109,7 +112,9 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{HEAP_SRV_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    CONST_VIEW_SPACE, HEAP_SRV_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -185,6 +190,17 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader accesses: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
+    /// Raw buffer SRVs whose 64-bit addresses live in consecutive
+    /// `RootType::Constants` dwords `(slot, first_dword)`: bound at `t<n>`
+    /// (position `n`) in [`CONST_VIEW_SPACE`].
+    pub const_srvs: Vec<(u8, u32)>,
+    /// Raw buffer UAVs whose 64-bit addresses live in consecutive
+    /// `RootType::Constants` dwords `(slot, first_dword)`: bound at `u<n>`
+    /// (position `n`) in [`CONST_VIEW_SPACE`].
+    pub const_uavs: Vec<(u8, u32)>,
     /// Whether the shader reads view-heap memory as raw data through `t0`
     /// in [`HEAP_SRV_SPACE`].
     pub view_heap: bool,
@@ -382,6 +398,9 @@ pub fn emit_with(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        const_srvs: l.const_srvs,
+        const_uavs: l.const_uavs,
         view_heap: l.view_heap,
         descriptor_tables: l.descriptor_tables,
     })
@@ -640,6 +659,9 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
             view_heap: false,
             descriptor_tables: Vec::new(),
         };
@@ -652,6 +674,9 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                const_srvs: Vec::new(),
+                const_uavs: Vec::new(),
                 view_heap: false,
                 descriptor_tables: Vec::new(),
             })

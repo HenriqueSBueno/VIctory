@@ -9,12 +9,15 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs and SRVs are bound: `b<root parameter index>` and
-/// `t<root parameter index>` in this space.
+/// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
+/// `t<root parameter index>` and `u<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the raw buffer SRV over the title's view descriptor heap is bound:
 /// `t0` in this space.
 pub const HEAP_SRV_SPACE: u32 = 2;
+/// Where 64-bit buffer addresses carried in `RootType::Constants` are bound:
+/// `t<n>` and `u<n>` in this space.
+pub const CONST_VIEW_SPACE: u32 = 3;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -68,6 +71,12 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) read or written, likewise.
+    pub root_uavs: Vec<(u8, V)>,
+    /// 64-bit constant-parameter SRVs `(slot, dword)`, in `t<n>` order in [`CONST_VIEW_SPACE`].
+    pub const_srvs: Vec<((u8, u32), V)>,
+    /// 64-bit constant-parameter UAVs `(slot, dword)`, in `u<n>` order in [`CONST_VIEW_SPACE`].
+    pub const_uavs: Vec<((u8, u32), V)>,
     /// Handle of the view-heap raw buffer SRV (`t0` in [`HEAP_SRV_SPACE`]).
     pub view_heap: Option<V>,
     pub flags: u64,
@@ -123,6 +132,9 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
             view_heap: None,
             flags: 0,
             threads: None,
@@ -215,13 +227,10 @@ impl Shader {
         h
     }
 
-    /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
-    pub fn root_srv_handle(&mut self, slot: u8) -> V {
-        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
-            return h;
-        }
-        let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
+    fn raw_buffer_handle(&mut self, space: u32, reg: u32, uav: bool) -> V {
+        let r = self.m.i32(reg);
+        let class = if uav { 1 } else { 0 };
+        let bind = [r, r, self.m.i32(space), self.m.i8(class)];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -233,9 +242,53 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11, 0);
+        let props0 = if uav { 11 | 0x1000 } else { 11 };
+        let h = self.annotate(block, h, props0, 0);
         self.flags |= flags::RAW_BUFFERS;
+        h
+    }
+
+    /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
+    pub fn root_srv_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let h = self.raw_buffer_handle(ROOT_CBV_SPACE, u32::from(slot), false);
         self.root_srvs.push((slot, h));
+        h
+    }
+
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let h = self.raw_buffer_handle(ROOT_CBV_SPACE, u32::from(slot), true);
+        self.root_uavs.push((slot, h));
+        h
+    }
+
+    /// The handle of a raw SRV whose 64-bit address arrives in `RootType::Constants`
+    /// at `(slot, dword..dword+2)`.
+    pub fn const_srv_handle(&mut self, slot: u8, dword: u32) -> V {
+        if let Some(&(_, h)) = self.const_srvs.iter().find(|r| r.0 == (slot, dword)) {
+            return h;
+        }
+        let reg = self.const_srvs.len() as u32;
+        let h = self.raw_buffer_handle(CONST_VIEW_SPACE, reg, false);
+        self.const_srvs.push(((slot, dword), h));
+        h
+    }
+
+    /// The handle of a raw UAV whose 64-bit address arrives in `RootType::Constants`
+    /// at `(slot, dword..dword+2)`.
+    pub fn const_uav_handle(&mut self, slot: u8, dword: u32) -> V {
+        if let Some(&(_, h)) = self.const_uavs.iter().find(|r| r.0 == (slot, dword)) {
+            return h;
+        }
+        let reg = self.const_uavs.len() as u32;
+        let h = self.raw_buffer_handle(CONST_VIEW_SPACE, reg, true);
+        self.const_uavs.push(((slot, dword), h));
         h
     }
 
@@ -337,6 +390,9 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
+            || !self.const_srvs.is_empty()
+            || !self.const_uavs.is_empty()
             || self.view_heap.is_some()
         {
             let empty = self.m.md_str("");
@@ -397,6 +453,9 @@ impl Shader {
                 .iter()
                 .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
                 .collect();
+            for reg in 0..self.const_srvs.len() {
+                srv_slots.push((CONST_VIEW_SPACE, reg as u32));
+            }
             if self.view_heap.is_some() {
                 srv_slots.push((HEAP_SRV_SPACE, 0));
             }
@@ -429,6 +488,47 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            let mut uav_slots: Vec<(u32, u32)> = self
+                .root_uavs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            for reg in 0..self.const_uavs.len() {
+                uav_slots.push((CONST_VIEW_SPACE, reg as u32));
+            }
+            if !uav_slots.is_empty() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let f = self.m.bool(false);
+                let mut list = Vec::new();
+                for (n, (space, slot)) in uav_slots.into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, slot)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(self.m.md_value(f)),
+                        Some(self.m.md_value(f)),
+                        Some(self.m.md_value(f)),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space,
+                        register: slot,
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -458,12 +558,13 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs, UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
-                _ => 2,
+                4 => 2,
+                _ => 3,
             });
         }
         if let Some(r) = resources {

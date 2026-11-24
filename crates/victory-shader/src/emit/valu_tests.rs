@@ -148,6 +148,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        const_srvs: lowered.const_srvs,
+        const_uavs: lowered.const_uavs,
         view_heap: lowered.view_heap,
         descriptor_tables: lowered.descriptor_tables,
     };

@@ -279,9 +279,16 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    for pairs in [&s.const_srvs, &s.const_uavs] {
+        word(&mut out, pairs.len() as u32);
+        for &(slot, dword) in pairs {
+            out.push(slot);
+            word(&mut out, dword);
+        }
     }
     out.push(u8::from(s.view_heap));
     word(&mut out, s.descriptor_tables.len() as u32);
@@ -306,6 +313,14 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         fn list(&mut self) -> Option<Vec<u8>> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
+        }
+        fn pairs(&mut self) -> Option<Vec<(u8, u32)>> {
+            let n = self.word()? as usize;
+            let mut out = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                out.push((self.byte()?, self.word()?));
+            }
+            Some(out)
         }
     }
     let mut r = Reader(bytes);
@@ -345,6 +360,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
+    let const_srvs = r.pairs()?;
+    let const_uavs = r.pairs()?;
     let view_heap = match r.byte()? {
         0 => false,
         1 => true,
@@ -359,6 +377,9 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
+        const_srvs,
+        const_uavs,
         view_heap,
         descriptor_tables,
     })
@@ -387,6 +408,9 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            root_uavs: vec![1, 5],
+            const_srvs: vec![(4, 2)],
+            const_uavs: vec![(4, 6)],
             view_heap: true,
             descriptor_tables: vec![1, 4],
         }

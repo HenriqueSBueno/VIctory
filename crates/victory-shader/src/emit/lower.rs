@@ -35,12 +35,16 @@ enum DataTarget {
     Cbv(V),
 }
 
+#[derive(Debug)]
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
+    pub const_srvs: Vec<(u8, u32)>,
+    pub const_uavs: Vec<(u8, u32)>,
     pub view_heap: bool,
     pub descriptor_tables: Vec<u8>,
     pub user_data: Vec<UserData>,
@@ -292,6 +296,8 @@ struct Lower<'a> {
     mixed_table_ud: HashMap<u8, u32>,
     /// Cached entry-block loads of `mixed_table_ud` by root parameter slot.
     mixed_table_vals: HashMap<u8, V>,
+    /// `(slot, first_dword)` pairs in `RootType::Constants` written by stores or atomics.
+    const_uavs: HashSet<(u8, u32)>,
 }
 
 /// Dwords read by `s_load_dword*`.
@@ -2034,6 +2040,18 @@ impl<'a> Lower<'a> {
             .map(|(ud, slot)| (slot, ud))
             .collect();
         let descriptor_tables: Vec<u8> = descriptor_tables_set.into_iter().collect();
+        let mut const_uavs = HashSet::new();
+        for d in &x.res.descriptors {
+            if let Source::Built { address, .. } = d.source
+                && let Some(rp) = x.native.layout.get(address.param)
+                && rp.root == RootType::Constants
+            {
+                let name = p.blocks[d.site.0].insts[d.site.1].name();
+                if name.starts_with("buffer_store_") || name.starts_with("buffer_atomic_") {
+                    const_uavs.insert((rp.slot, address.dword));
+                }
+            }
+        }
 
         let fence_only_barrier = divergent_barriers(p, x.st, &no_barrier);
         Lower {
@@ -2112,6 +2130,7 @@ impl<'a> Lower<'a> {
             descriptor_tables,
             mixed_table_ud,
             mixed_table_vals: HashMap::new(),
+            const_uavs,
         }
     }
 
@@ -2236,7 +2255,8 @@ impl<'a> Lower<'a> {
                 bits: 0,
                 words: [0, 0],
             };
-            Some(self.handle((b, i), &src, false, (11, 0))?)
+            let u = if self.is_built_uav(&src) { 0x1000 } else { 0 };
+            Some(self.handle((b, i), &src, false, (11 | u, 0))?)
         };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
@@ -3015,6 +3035,9 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let const_srvs = self.s.const_srvs.iter().map(|r| r.0).collect();
+        let const_uavs = self.s.const_uavs.iter().map(|r| r.0).collect();
         let view_heap = self.s.view_heap.is_some();
         let descriptor_tables = std::mem::take(&mut self.descriptor_tables);
         let cmp_samplers = self.s.cmp_samplers;
@@ -3022,6 +3045,9 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
+            const_srvs,
+            const_uavs,
             view_heap,
             descriptor_tables,
             dxil: self.s.finish(),
@@ -5051,8 +5077,11 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
+            || self.is_built_const(src)
+        {
+            let u = if self.is_built_uav(src) { 0x1000 } else { 0 };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -5170,11 +5199,27 @@ impl<'a> Lower<'a> {
                     Some(ResourceType::Srv) => {
                         Ok((DataTarget::Raw(self.s.root_srv_handle(rp.slot)), addr))
                     }
+                    Some(ResourceType::Uav) => {
+                        Ok((DataTarget::Raw(self.s.root_uav_handle(rp.slot)), addr))
+                    }
                     Some(ResourceType::Cbv) | None => {
                         Ok((DataTarget::Cbv(self.s.root_cbv_handle(rp.slot)), addr))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    _ => Err("a typed root view"),
                 }
+            }
+            RootType::Constants => {
+                let mut addr = self.s.m.i32(a.offset);
+                if let Some(d) = a.dynamic {
+                    let d = self.i32_of(d)?;
+                    addr = self.s.m.bin(c, Bin::Add, addr, d);
+                }
+                let h = if self.const_uavs.contains(&(rp.slot, a.dword)) {
+                    self.s.const_uav_handle(rp.slot, a.dword)
+                } else {
+                    self.s.const_srv_handle(rp.slot, a.dword)
+                };
+                Ok((DataTarget::Raw(h), addr))
             }
             RootType::SamplerHeap => Err("a sampler heap read as data"),
             _ => Err("a descriptor read only as data"),
@@ -5568,6 +5613,40 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether a built descriptor accesses a UAV (root UAV or constant-pair
+    /// pointer written by stores or atomics).
+    fn is_built_uav(&self, src: &Source) -> bool {
+        let Source::Built { address, .. } = src else {
+            return false;
+        };
+        let Some(rp) = self.x.native.layout.get(address.param) else {
+            return false;
+        };
+        match rp.root {
+            RootType::Descriptor => self.x.native.used.iter().any(|u| {
+                u.root == RootType::Descriptor
+                    && u.user_data == rp.user_data
+                    && u.kind == ResourceType::Uav
+            }),
+            RootType::Constants => self.const_uavs.contains(&(rp.slot, address.dword)),
+            _ => false,
+        }
+    }
+
+    /// Whether a built descriptor is a 64-bit address in `RootType::Constants`.
+    fn is_built_const(&self, src: &Source) -> bool {
+        matches!(
+            src,
+            Source::Built { address, .. }
+                if self
+                    .x
+                    .native
+                    .layout
+                    .get(address.param)
+                    .is_some_and(|rp| rp.root == RootType::Constants)
+        )
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } = src {
@@ -5654,8 +5733,9 @@ impl<'a> Lower<'a> {
                     .native
                     .used
                     .iter()
-                    .find(|u| u.user_data == rp.user_data)
+                    .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data)
                     .map(|u| u.kind);
+                let const_uav = self.const_uavs.contains(&(rp.slot, address.dword));
                 match (rp.root, kind, props.0) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
@@ -5663,7 +5743,16 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav) | None, 0x100b) => {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    (RootType::Constants, _, 11) if !const_uav => {
+                        Ok(self.s.const_srv_handle(rp.slot, address.dword))
+                    }
+                    (RootType::Constants, _, 0x100b) => {
+                        Ok(self.s.const_uav_handle(rp.slot, address.dword))
+                    }
+                    _ => Err("a typed root view"),
                 }
             }
             Source::Phi { block, args } => {
@@ -8457,7 +8546,32 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        // Root descriptors and constant-pair pointers only bind as raw buffers;
+        // fold any structured index * stride into the byte offset.
+        let mut index = index;
+        if let Some(idx) = index
+            && !typed
+            && format.is_none()
+            && matches!(src, Source::Built { .. })
+        {
+            let mut stride = used.map_or(0, |u| u.stride);
+            if stride == 0
+                && let Source::Built { bits, .. } = *src
+            {
+                stride = (bits >> 16) & 0x3FFF;
+            }
+            if stride < 4 || !stride.is_multiple_of(4) {
+                return Err("a structured buffer of unknown stride");
+            }
+            let s = self.s.m.i32(stride);
+            let prod = self.s.m.bin(c, Bin::Mul, idx, s);
+            off = self.s.m.bin(c, Bin::Add, off, prod);
+            index = None;
+        }
+        let uav = store
+            || atomic.is_some()
+            || used.is_some_and(|u| u.kind == ResourceType::Uav)
+            || self.is_built_uav(src);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
@@ -10154,5 +10268,310 @@ mod tests {
         }
         assert_eq!(lowered.user_data.len(), 1);
         assert_eq!(lowered.user_data[0].index, 16);
+    }
+
+    fn lower_cs(
+        words: &[u32],
+        layout: Vec<crate::native::RootParam>,
+        used: Vec<crate::native::UsedResource>,
+        rsrc2: u32,
+    ) -> Result<super::Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 16,
+            layout,
+            used,
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = super::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            options: super::TranslateOptions::default(),
+        })?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone()).unwrap();
+        }
+        Ok(lowered)
+    }
+
+    fn mubuf_inst(op: u32, offset: u16, idxen: bool, srsrc: u8, vdata: u8, vaddr: u8) -> [u32; 2] {
+        [
+            (0x38 << 26) | (op << 18) | (u32::from(idxen) << 13) | (u32::from(offset) & 0xFFF),
+            (0x80 << 24) | ((u32::from(srsrc >> 2) & 0x1F) << 16) | (u32::from(vdata) << 8) | u32::from(vaddr),
+        ]
+    }
+
+    #[test]
+    fn spilled_root_uav_lowers_and_validates() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        use super::super::ROOT_CBV_SPACE;
+
+        let mut words = vec![
+            0x8703_FF01,
+            0x0000_00ff, // s_and_b32 s3, s1, 0xff
+            0xBE82_0300, // s_mov_b32 s2, s0
+        ];
+        // s_load_dwordx2 s[0:1], s[2:3], 0x08 -> user_data 18..19 (slot 1 Root UAV)
+        words.extend_from_slice(&smem_load(1, 0, 2, 125, 0x08));
+        words.extend_from_slice(&[
+            0x8801_FF01,
+            0x0010_0000, // s_or_b32 s1, s1, 0x100000
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+            0xF420_0100,
+            0xFA00_0000, // s_buffer_load_dword s4, s[0:3], null
+        ]);
+        words.push(v_mov_b32(1, 4));
+        words.extend_from_slice(&mubuf_inst(0x0C, 4, false, 0, 0, 0)); // buffer_load_dword
+        words.extend_from_slice(&mubuf_inst(0x1C, 16, false, 0, 1, 0)); // buffer_store_dword
+        words.extend_from_slice(&mubuf_inst(0x32, 32, false, 0, 1, 0)); // buffer_atomic_add
+        words.push(S_ENDPGM);
+
+        let layout = vec![
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 18,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 16,
+                base_register: 0,
+                user_data: 20,
+                slot: 2,
+            },
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            user_data: 18,
+            slot: 1,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            dwords: 4,
+            stride: 0,
+        }];
+        let lowered = lower_cs(&words, layout, used, 2 << 1).unwrap();
+        assert!(lowered.root_cbvs.is_empty());
+        assert!(lowered.root_srvs.is_empty());
+        assert_eq!(lowered.root_uavs, vec![1]);
+        assert!(lowered.const_srvs.is_empty());
+        assert!(lowered.const_uavs.is_empty());
+        assert!(psv_bindings(&lowered.dxil).contains(&[7, ROOT_CBV_SPACE, 1, 1, 11, 0]));
+    }
+
+    #[test]
+    fn structured_root_uav_folds_stride_and_typed_root_view_stays_rejected() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        use super::super::ROOT_CBV_SPACE;
+
+        let layout = vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 1,
+        }];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            user_data: 0,
+            slot: 1,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            dwords: 4,
+            stride: 16,
+        }];
+        let prefix = vec![
+            0x8801_FF01,
+            0x0010_0000, // s_or_b32 s1, s1, 0x100000
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+        ];
+
+        // Structured idxen buffer_load + buffer_store folds index * 16 into raw offset.
+        let mut structured = prefix.clone();
+        structured.extend_from_slice(&mubuf_inst(0x0C, 4, true, 0, 1, 0));
+        structured.extend_from_slice(&mubuf_inst(0x1C, 8, true, 0, 1, 0));
+        structured.push(S_ENDPGM);
+        let lowered = lower_cs(&structured, layout.clone(), used.clone(), 2 << 1).unwrap();
+        assert_eq!(lowered.root_uavs, vec![1]);
+        assert!(psv_bindings(&lowered.dxil).contains(&[7, ROOT_CBV_SPACE, 1, 1, 11, 0]));
+
+        // Typed buffer_store_format_xyzw remains rejected on root views.
+        let mut typed = prefix;
+        typed.extend_from_slice(&mubuf_inst(0x07, 0, true, 0, 0, 0));
+        typed.push(S_ENDPGM);
+        assert_eq!(
+            lower_cs(&typed, layout, used, 2 << 1).unwrap_err(),
+            crate::ShaderError::Unsupported {
+                offset: 20,
+                what: "a typed root view",
+            }
+        );
+    }
+
+    #[test]
+    fn constants_64bit_address_lowers_to_const_srv_and_uav_and_validates() {
+        use crate::native::{RootParam, RootType};
+        use super::super::CONST_VIEW_SPACE;
+
+        let layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 2,
+        }];
+        let prefix = vec![
+            0x8801_FF01,
+            0x0010_0000, // s_or_b32 s1, s1, 0x100000
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+        ];
+
+        // Read-only constant pointer becomes const_srvs (t0 in CONST_VIEW_SPACE).
+        let mut srv_words = prefix.clone();
+        srv_words.extend_from_slice(&mubuf_inst(0x0C, 0, false, 0, 0, 0));
+        srv_words.push(S_ENDPGM);
+        let srv_lowered = lower_cs(&srv_words, layout.clone(), vec![], 4 << 1).unwrap();
+        assert_eq!(srv_lowered.const_srvs, vec![(2, 0)]);
+        assert!(srv_lowered.const_uavs.is_empty());
+        assert!(psv_bindings(&srv_lowered.dxil).contains(&[4, CONST_VIEW_SPACE, 0, 0, 11, 0]));
+
+        // Read+write constant pointer promotes to const_uavs (u0 in CONST_VIEW_SPACE).
+        let mut uav_words = prefix;
+        uav_words.extend_from_slice(&mubuf_inst(0x0C, 0, false, 0, 0, 0));
+        uav_words.extend_from_slice(&mubuf_inst(0x1C, 4, false, 0, 0, 0));
+        uav_words.push(S_ENDPGM);
+        let uav_lowered = lower_cs(&uav_words, layout, vec![], 4 << 1).unwrap();
+        assert!(uav_lowered.const_srvs.is_empty());
+        assert_eq!(uav_lowered.const_uavs, vec![(2, 0)]);
+        assert!(psv_bindings(&uav_lowered.dxil).contains(&[7, CONST_VIEW_SPACE, 0, 0, 11, 0]));
+    }
+
+    #[test]
+    fn constants_dword0_offset_added_to_table_and_root_descriptor_lowers() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        use super::super::{HEAP_SRV_SPACE, ROOT_CBV_SPACE};
+
+        // Table (s0) + Constants[0] (s1) added into s[2:3], read as heap data -> view_heap.
+        let table_words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x8002_0104, // s_add_u32 s2, s4, s1
+            0x8203_8005, // s_addc_u32 s3, s5, 0
+        ];
+        let mut table_full = table_words;
+        table_full.extend_from_slice(&smem_load(0, 6, 2, 125, 0));
+        table_full.push(v_mov_b32(1, 6));
+        table_full.extend_from_slice(&[0xD834_0000, 0x0000_0100]); // ds_write_b32 v0, v1
+        table_full.push(S_ENDPGM);
+        let table_layout = vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 1,
+                slot: 1,
+            },
+        ];
+        let table_lowered =
+            lower_cs(&table_full, table_layout, vec![], (2 << 1) | (1 << 15)).unwrap();
+        assert!(table_lowered.view_heap);
+        assert!(psv_bindings(&table_lowered.dxil).contains(&[4, HEAP_SRV_SPACE, 0, 0, 11, 0]));
+
+        // Root Descriptor UAV (s[0:1]) + Constants[0] (s2) via soffset in buffer_store_dword.
+        let mut desc_words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0x8805_FF01,
+            0x0010_0000, // s_or_b32 s5, s1, 0x100000
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+        ];
+        // buffer_store_dword v0, off, s[4:7], s2 offset:0
+        desc_words.extend_from_slice(&[
+            (0x38 << 26) | (0x1C << 18),
+            (2 << 24) | ((4 >> 2) << 16),
+        ]);
+        desc_words.push(S_ENDPGM);
+        let desc_layout = vec![
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ];
+        let desc_used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            user_data: 0,
+            slot: 0,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            dwords: 4,
+            stride: 0,
+        }];
+        let desc_lowered = lower_cs(&desc_words, desc_layout, desc_used, 3 << 1).unwrap();
+        assert_eq!(desc_lowered.root_uavs, vec![0]);
+        assert!(psv_bindings(&desc_lowered.dxil).contains(&[7, ROOT_CBV_SPACE, 0, 0, 11, 0]));
     }
 }
