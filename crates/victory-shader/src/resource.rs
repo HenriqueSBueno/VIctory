@@ -86,25 +86,30 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// User SGPRs and spill-table loads holding root parameters: value,
+    /// layout index, dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Scalar loads from the user-data spill table (`user_data >= 16`).
+    pub spill_loads: Vec<Site>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace.
 pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage)?;
+    let mut t = Tracer::new(p, layout, stage)?;
+    let mut params: Vec<(Value, usize, u32)> = p
+        .inputs
+        .iter()
+        .filter_map(|&(reg, v)| {
+            let (param, dword) = t.param_of(reg)?;
+            Some((v, param, dword))
+        })
+        .collect();
+    params.extend(t.collect_spill_loads()?);
     let mut out = Resources {
-        params: p
-            .inputs
-            .iter()
-            .filter_map(|&(reg, v)| {
-                let (param, dword) = t.param_of(reg)?;
-                Some((v, param, dword))
-            })
-            .collect(),
+        params,
+        spill_loads: t.spill_loads.clone(),
         ..Resources::default()
     };
     for (b, block) in p.blocks.iter().enumerate() {
@@ -136,6 +141,9 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
+                    if t.spill_loads.contains(&site) {
+                        continue;
+                    }
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -183,6 +191,13 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// Entry SGPR values holding the user-data spill-table pointer (`user_sgpr(0..=1)`),
+    /// when `layout` has parameters at `user_data >= 16`.
+    spill_ptr: Option<(Value, Value)>,
+    /// SSA values produced by spill-table loads: `(param_index, dword)`.
+    spilled: std::collections::HashMap<Value, (usize, u32)>,
+    /// Sites of resolved spill-table scalar loads.
+    spill_loads: Vec<Site>,
 }
 
 const MAX_ROUNDS: usize = 64;
@@ -239,8 +254,27 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            spill_ptr: None,
+            spilled: std::collections::HashMap::new(),
+            spill_loads: Vec::new(),
         };
         t.origin = t.propagate_copies(n)?;
+        let has_spill = layout
+            .iter()
+            .any(|rp| rp.user_data >= 16 || u32::from(rp.user_data) + rp.sgprs > 16);
+        if has_spill {
+            let u0 = Reg::S(stage.user_sgpr(0));
+            let u1 = Reg::S(stage.user_sgpr(1));
+            if t.param_of(u0).is_none()
+                && t.param_of(u1).is_none()
+                && let (Some(lo), Some(hi)) = (
+                    p.inputs.iter().find(|i| i.0 == u0).map(|i| i.1),
+                    p.inputs.iter().find(|i| i.0 == u1).map(|i| i.1),
+                )
+            {
+                t.spill_ptr = Some((lo, hi));
+            }
+        }
         Ok(t)
     }
 
@@ -326,10 +360,146 @@ impl<'a> Tracer<'a> {
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
+            if p.user_data >= 16 {
+                return None;
+            }
             let first = self.stage.user_sgpr(p.user_data);
             let dword = u32::from(code).checked_sub(first.into())?;
+            (dword < p.sgprs && u32::from(p.user_data) + dword < 16).then_some((i, dword))
+        })
+    }
+
+    /// Layout index and dword of the root parameter `v` holds, either from
+    /// an entry user SGPR or from a spill-table load.
+    fn param_value(&self, v: Value) -> Option<(usize, u32)> {
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            return self.param_of(reg);
+        }
+        self.spilled.get(&v).copied()
+    }
+
+    /// Layout index and dword covering spilled user-data slot `ud >= 16`.
+    fn spilled_param_of(&self, ud: u32) -> Option<(usize, u32)> {
+        if ud < 16 {
+            return None;
+        }
+        self.layout.iter().enumerate().find_map(|(i, p)| {
+            let dword = ud.checked_sub(u32::from(p.user_data))?;
             (dword < p.sgprs).then_some((i, dword))
         })
+    }
+
+    /// Strips a 40/48-bit pointer mask (`s_and_b32 x, 0xff/0xffff` or `s_bfe_u32`).
+    fn strip_hi_mask(&self, v: Value) -> Option<Term> {
+        if let Some((_, [a, Term::Const(mask)] | [Term::Const(mask), a])) =
+            self.sop2(v, &["s_and_b32"])
+            && mask & 0xff == 0xff
+        {
+            return Some(a);
+        }
+        if let Some((_, [a, Term::Const(ctrl)])) = self.sop2(v, &["s_bfe_u32"]) {
+            let off = ctrl & 0x1F;
+            let width = (ctrl >> 16) & 0x7F;
+            if off == 0 && width >= 8 {
+                return Some(a);
+            }
+        }
+        None
+    }
+
+    fn is_spill_hi(&self, t: Term, hi_val: Value) -> bool {
+        let Term::Value(v) = t else { return false };
+        if v == hi_val {
+            return true;
+        }
+        if let Some(a) = self.strip_hi_mask(v) {
+            return self.is_spill_hi(a, hi_val);
+        }
+        if let Some((_, [a, Term::Const(0)] | [Term::Const(0), a])) = self.sop2(v, &["s_addc_u32"])
+        {
+            return self.is_spill_hi(a, hi_val);
+        }
+        false
+    }
+
+    /// Recognizes scalar loads from the user-data spill table (`s[0:1]` of the
+    /// stage's user SGPRs) and resolves their destination dwords to `(param, dword)`.
+    fn collect_spill_loads(&mut self) -> Result<Vec<(Value, usize, u32)>, ShaderError> {
+        let Some((spill_lo, spill_hi)) = self.spill_ptr else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if !inst.name().starts_with("s_load_dword") {
+                    continue;
+                }
+                let Fields::Smem {
+                    data: Some(Operand::Scalar { code, dwords }),
+                    base: Operand::Scalar { code: bcode, .. },
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    continue;
+                };
+                let (Some(lo_v), Some(hi_v)) =
+                    (inst.read(Reg::S(*bcode)), inst.read(Reg::S(bcode + 1)))
+                else {
+                    continue;
+                };
+                let (lo, hi) = (self.origin(lo_v), self.origin(hi_v));
+                if !self.is_spill_hi(hi, spill_hi) {
+                    continue;
+                }
+                let s = self.sum(lo);
+                if s.base.is_some() {
+                    continue;
+                }
+                let fail = |what| ShaderError::Unsupported {
+                    offset: inst.machine.offset,
+                    what,
+                };
+                if s.dynamic != Some(spill_lo) {
+                    if s.dynamic
+                        .is_some_and(|v| self.leaves(v).any(|l| l == spill_lo))
+                    {
+                        return Err(fail("a spill-table load at a dynamic offset"));
+                    }
+                    continue;
+                }
+                let so_term = self
+                    .term(inst, soffset)
+                    .ok_or_else(|| fail("an unknown offset operand"))?;
+                let extra = self.sum(so_term);
+                if extra.base.is_some() || extra.dynamic.is_some() {
+                    return Err(fail("a spill-table load at a dynamic offset"));
+                }
+                let byte_off = i64::from(s.offset) + i64::from(extra.offset) + i64::from(*offset);
+                if byte_off < 0 || byte_off % 4 != 0 {
+                    return Err(fail("an unaligned spill-table load"));
+                }
+                let Ok(first_ud) = u32::try_from(16 + byte_off / 4) else {
+                    return Err(fail("a spill-table load outside the root layout"));
+                };
+                let mut matched = false;
+                for k in 0..*dwords {
+                    if let Some((param, dword)) = self.spilled_param_of(first_ud + u32::from(k))
+                        && let Some(v) = inst.write(Reg::S(code + k))
+                    {
+                        self.spilled.insert(v, (param, dword));
+                        out.push((v, param, dword));
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    return Err(fail("a spill-table load outside the root layout"));
+                }
+                self.spill_loads.push((b, i));
+            }
+        }
+        Ok(out)
     }
 
     /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
@@ -366,15 +536,15 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
-                _ => dynamic,
+        if let Some((_, 0)) = self.param_value(v) {
+            return Sum {
+                base: Some(v),
+                offset: 0,
+                dynamic: None,
             };
+        }
+        if self.inputs[v.0 as usize].is_some() {
+            return dynamic;
         }
         if self.getpc(v).is_some() {
             return Sum {
@@ -514,7 +684,9 @@ impl<'a> Tracer<'a> {
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
-            if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
+            let match_pc = |t: Term| high.is_some_and(|h| t == Term::Value(h));
+            let match_pc_v = |v: Value| high == Some(v);
+            if !self.high_half(hi, &match_pc) && !self.carried(hi, &match_pc_v) {
                 return Err("an address with an untracked high half");
             }
             return Ok(Address {
@@ -525,52 +697,70 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .param_value(base)
             .ok_or("an address not from a root parameter")?;
-        let high = match self.layout[param].root {
-            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+        let descriptor = match self.layout[param].root {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => false,
+            RootType::Descriptor => true,
             _ => return Err("an address from a root parameter that is no address"),
         };
+        if descriptor {
+            let has_high = self
+                .p
+                .inputs
+                .iter()
+                .any(|&(r, _)| self.param_of(r) == Some((param, 1)))
+                || self.spilled.values().any(|&p| p == (param, 1));
+            if !has_high {
+                return Err("a root descriptor without its high half");
+            }
+        }
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
-            && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
+        let is_high_term = |t: Term| self.is_param_high(t, descriptor.then_some(param));
+        let is_high_val = |v: Value| descriptor && self.is_param_high(Term::Value(v), Some(param));
+        if !self.high_half(hi, &is_high_term)
+            && !(dynamic.is_some() && self.carried(hi, &is_high_val))
         {
             return Err("an address with an untracked high half");
         }
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            dynamic,
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
-    fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
-        let want = high.map_or(Term::Const(0), Term::Value);
-        hi == want
+    fn is_param_high(&self, t: Term, param: Option<usize>) -> bool {
+        match (param, t) {
+            (None, Term::Const(0)) => true,
+            (Some(p), Term::Value(v)) => {
+                self.param_value(v) == Some((p, 1))
+                    || matches!(self.strip_hi_mask(v), Some(x) if self.is_param_high(x, Some(p)))
+            }
+            _ => false,
+        }
+    }
+
+    /// `hi` satisfies `want` (0 for a table, high half for descriptor/code), possibly plus a carry.
+    fn high_half(&self, hi: Term, want: &dyn Fn(Term) -> bool) -> bool {
+        want(hi)
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
-                |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+                |(_, [a, b])| want(a) && b == Term::Const(0) || want(b) && a == Term::Const(0)
             ))
     }
 
-    /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
-    /// `v_add_co_ci_u32` with `high` as an operand.
-    fn carried(&self, hi: Term, high: Value) -> bool {
+    /// `hi` adds something (with carry) to `want`: `s_addc_u32` or
+    /// `v_add_co_ci_u32` with a value matching `want` as an operand.
+    fn carried(&self, hi: Term, want: &dyn Fn(Value) -> bool) -> bool {
         let Term::Value(v) = hi else { return false };
-        if v == high {
+        if want(v) {
             return true;
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
-            return self.carried(a, high) || self.carried(b, high);
+            return self.carried(a, want) || self.carried(b, want);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -581,7 +771,7 @@ impl<'a> Tracer<'a> {
         inst.name() == "v_add_co_ci_u32"
             && f.src[..2.min(f.src.len())]
                 .iter()
-                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+                .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, want)))
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
@@ -1157,6 +1347,159 @@ mod tests {
             ShaderError::Unsupported {
                 offset: 0,
                 what: "an address in an SGPR that is no root parameter"
+            }
+        );
+    }
+
+    fn smem_load(op: u32, dst: u8, base: u8, soff: u8, offset: u32) -> [u32; 2] {
+        [
+            (0x3D << 26) | (op << 18) | (u32::from(dst) << 6) | u32::from(base >> 1),
+            (u32::from(soff) << 25) | (offset & 0x1F_FFFF),
+        ]
+    }
+
+    fn s_and_b32_imm(dst: u8, src: u8, imm: u32) -> [u32; 2] {
+        [0x8700_FF00 | (u32::from(dst) << 16) | u32::from(src), imm]
+    }
+
+    fn s_mov_b32_s(dst: u8, src: u8) -> u32 {
+        0xBE80_0300 | (u32::from(dst) << 16) | u32::from(src)
+    }
+
+    #[test]
+    fn spill_table_loads_resolve_constants_and_root_descriptors() {
+        let mut words = Vec::new();
+        // s_and_b32 s3, s1, 0xff; s_mov_b32 s2, s0
+        words.extend_from_slice(&s_and_b32_imm(3, 1, 0xff));
+        words.push(s_mov_b32_s(2, 0));
+        // 0: s_load_dwordx16 s[8:23], s[2:3], 0x10 -> user_data 20..35 (Constants, param 2)
+        words.extend_from_slice(&smem_load(4, 8, 2, 125, 0x10));
+        // 1: s_load_dwordx2 s[0:1], s[2:3], 0x08 -> user_data 18..19 (Descriptor, param 1)
+        words.extend_from_slice(&smem_load(1, 0, 2, 125, 0x08));
+        // Scalar load from the spilled root descriptor at offset 0x20.
+        words.extend_from_slice(&smem_load(2, 4, 0, 125, 0x20));
+        // Build a buffer descriptor around the spilled root descriptor s[0:1] -> s[0:3].
+        words.extend_from_slice(&[
+            0x8801_FF01,
+            0x0010_0000, // s_or_b32 s1, s1, 0x100000
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+            0xF430_0000,
+            0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
+            S_ENDPGM,
+        ]);
+        let layout = [
+            param(Descriptor, 16, 2),
+            param(Descriptor, 18, 2),
+            param(Constants, 20, 16),
+        ];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert_eq!(r.spill_loads, [(0, 2), (0, 3)]);
+        assert_eq!(r.scalar, [((0, 4), at(1, 0x20))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(1, 0),
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC],
+            }
+        );
+        // 16 dwords from Constants (param 2) + 2 dwords from Descriptor (param 1).
+        assert_eq!(r.params.len(), 18);
+        assert!(
+            (0..16).all(|d| r.params.iter().any(|&(_, p, dw)| p == 2 && dw == d)),
+            "{:?}",
+            r.params
+        );
+        assert!(r.params.iter().any(|&(_, p, dw)| p == 1 && dw == 0));
+        assert!(r.params.iter().any(|&(_, p, dw)| p == 1 && dw == 1));
+    }
+
+    #[test]
+    fn spill_table_works_in_merged_stages_and_for_descriptor_tables() {
+        // Mesh stage: user SGPRs start at s8, so the spill pointer arrives in s[8:9].
+        let mut words = Vec::new();
+        words.extend_from_slice(&s_and_b32_imm(11, 9, 0xff));
+        words.push(s_mov_b32_s(10, 8));
+        // s_load_dword s4, s[10:11], 0x00 -> user_data 16 (Table, param 0)
+        words.extend_from_slice(&smem_load(0, 4, 10, 125, 0x00));
+        words.push(0xBE85_0380); // s_mov_b32 s5, 0
+        // s_load_dwordx4 s[12:15], s[4:5], 0x20 -> descriptor from Table
+        words.extend_from_slice(&smem_load(2, 12, 4, 125, 0x20));
+        words.extend_from_slice(&[
+            0xE000_2000,
+            0x8003_0400, // buffer_load_format_x v4, v0, s[12:15], 0 idxen
+            S_ENDPGM,
+        ]);
+        let r = track_words(&words, &[param(Table, 16, 1)], HwStage::Ms);
+        assert_eq!(r.spill_loads, [(0, 2)]);
+        assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Loaded {
+                load: (0, 4),
+                first: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn spill_table_rejects_dynamic_unaligned_and_out_of_layout_loads() {
+        let track_err = |words: &[u32], layout: &[RootParam]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, layout, HwStage::Cs).unwrap_err()
+        };
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&s_and_b32_imm(3, 1, 0xff));
+        prefix.push(s_mov_b32_s(2, 0));
+
+        // Dynamic soffset (s4).
+        let mut dyn_off = prefix.clone();
+        dyn_off.extend_from_slice(&smem_load(0, 8, 2, 4, 0));
+        dyn_off.push(S_ENDPGM);
+        assert_eq!(
+            track_err(&dyn_off, &[param(Constants, 16, 4)]),
+            ShaderError::Unsupported {
+                offset: 12,
+                what: "a spill-table load at a dynamic offset",
+            }
+        );
+
+        // Unaligned byte offset (0x02).
+        let mut unaligned = prefix.clone();
+        unaligned.extend_from_slice(&smem_load(0, 8, 2, 125, 2));
+        unaligned.push(S_ENDPGM);
+        assert_eq!(
+            track_err(&unaligned, &[param(Constants, 16, 4)]),
+            ShaderError::Unsupported {
+                offset: 12,
+                what: "an unaligned spill-table load",
+            }
+        );
+
+        // Offset past the root layout (user_data 32 when layout only has 16..20).
+        let mut outside = prefix.clone();
+        outside.extend_from_slice(&smem_load(0, 8, 2, 125, 0x40));
+        outside.push(S_ENDPGM);
+        assert_eq!(
+            track_err(&outside, &[param(Constants, 16, 4)]),
+            ShaderError::Unsupported {
+                offset: 12,
+                what: "a spill-table load outside the root layout",
+            }
+        );
+
+        // Without user_data >= 16, s[0:1] is not a spill pointer.
+        let mut no_spill = prefix;
+        no_spill.extend_from_slice(&smem_load(0, 8, 2, 125, 0));
+        no_spill.push(S_ENDPGM);
+        assert_eq!(
+            track_err(&no_spill, &[param(Table, 9, 1)]),
+            ShaderError::Unsupported {
+                offset: 12,
+                what: "an address in an SGPR that is no root parameter",
             }
         );
     }

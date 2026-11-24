@@ -750,7 +750,7 @@ fn compute_uniformity(
                     && scalar_op
                     && inst.reads.iter().all(|&(_, v)| val_uniform[v.0 as usize]);
                 for &(_, w) in &inst.writes {
-                    if val_uniform[w.0 as usize] && !reads_ok {
+                    if val_uniform[w.0 as usize] && !reads_ok && !param_set.contains(&w) {
                         val_uniform[w.0 as usize] = false;
                         changed = true;
                     }
@@ -4112,6 +4112,15 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.x.res.spill_loads.contains(&site) {
+            for &(_, v) in &inst.writes {
+                if !self.params.contains_key(&v) {
+                    self.vals
+                        .insert(v, Val::Missing("an unmapped spill-table dword"));
+                }
+            }
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -9041,5 +9050,226 @@ mod tests {
         assert!(lowered.descriptor_tables.is_empty());
         assert_eq!(lowered.root_srvs, vec![3]);
         assert_eq!(loads, vec![(ROOT_CBV_SPACE, 3, Some(0x10))]);
+    }
+
+    #[test]
+    fn spilled_constants_and_root_descriptor_buffer_load() {
+        use super::super::{ROOT_CBV_SPACE, UserData};
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+
+        // s_and_b32 s3, s1, 0xff; s_mov_b32 s2, s0
+        let mut words = vec![
+            0x8703_FF01,
+            0x0000_00ff, // s_and_b32 s3, s1, 0xff
+            0xBE82_0300, // s_mov_b32 s2, s0
+        ];
+        // s_load_dwordx4 s[8:11], s[2:3], 0x10 -> user_data 20..23 (Constants, slot 1)
+        words.extend_from_slice(&smem_load(0x02, 8, 2, 125, 0x10));
+        // s_load_dwordx2 s[4:5], s[2:3], 0x00 -> user_data 16..17 (Descriptor SRV, slot 0)
+        words.extend_from_slice(&smem_load(0x01, 4, 2, 125, 0x00));
+        // Build raw buffer descriptor in s[4:7]: s6 = -1, s7 = 0x11014fac
+        words.push(0xBE86_03C1); // s_mov_b32 s6, -1
+        words.extend_from_slice(&[0xBE87_03FF, 0x1101_4FAC]); // s_mov_b32 s7, 0x11014fac
+        // v1 = s11 (user_data 23), buffer_load_dword v0, v1, s[4:7], s8 offen
+        words.push(v_mov_b32(1, 11));
+        words.extend_from_slice(&[
+            (0x38 << 26) | (0x0C << 18) | (1 << 12),
+            (8 << 24) | ((4 >> 2) << 16) | 1,
+        ]);
+        words.extend_from_slice(&exp_mrt0(0, 0, 0, 0));
+        words.push(S_ENDPGM);
+
+        let layout = vec![
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 16,
+                base_register: 0,
+                user_data: 20,
+                slot: 1,
+            },
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            user_data: 16,
+            slot: 0,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            dwords: 4,
+            stride: 0,
+        }];
+        let mut ud = vec![0u32; 24];
+        ud[20] = 0x40;
+        ud[23] = 0x100;
+        let (lowered, loads) = lower_ps(&words, layout, used, &ud).unwrap();
+        assert_eq!(lowered.root_srvs, vec![0]);
+        assert_eq!(
+            lowered.user_data,
+            vec![
+                UserData {
+                    index: 20,
+                    slot: 1,
+                    root: RootType::Constants,
+                    dword: 0,
+                },
+                UserData {
+                    index: 23,
+                    slot: 1,
+                    root: RootType::Constants,
+                    dword: 3,
+                },
+            ]
+        );
+        assert_eq!(loads, vec![(ROOT_CBV_SPACE, 0, Some(0x140))]);
+    }
+
+    #[test]
+    fn spilled_descriptor_table_and_constants_lower_to_heap_load() {
+        use super::super::UserData;
+        use crate::native::{RootParam, RootType};
+
+        let mut words = vec![
+            0x8703_FF01,
+            0x0000_00ff, // s_and_b32 s3, s1, 0xff
+            0xBE82_0300, // s_mov_b32 s2, s0
+        ];
+        // s_load_dword s4, s[2:3], 0x00 -> user_data 16 (Table, slot 2)
+        words.extend_from_slice(&smem_load(0x00, 4, 2, 125, 0x00));
+        words.push(0xBE85_0380); // s_mov_b32 s5, 0
+        // s_load_dword s6, s[2:3], 0x08 -> user_data 18 (Constants, slot 3)
+        words.extend_from_slice(&smem_load(0x00, 6, 2, 125, 0x08));
+        // s_load_dwordx4 s[8:11], s[4:5], 0x20 -> descriptor from Table
+        words.extend_from_slice(&smem_load(0x02, 8, 4, 125, 0x20));
+        // buffer_load_dword v0, v0, s[8:11], s6
+        words.extend_from_slice(&[(0x38 << 26) | (0x0C << 18), (6 << 24) | ((8 >> 2) << 16)]);
+        words.extend_from_slice(&exp_mrt0(0, 0, 0, 0));
+        words.push(S_ENDPGM);
+
+        let layout = vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 16,
+                slot: 2,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 18,
+                slot: 3,
+            },
+        ];
+        let mut ud = vec![0u32; 20];
+        ud[16] = 0x100;
+        ud[18] = 0x20;
+        let (lowered, _) = lower_ps(&words, layout, vec![], &ud).unwrap();
+        assert_eq!(lowered.descriptor_tables, vec![2]);
+        assert_eq!(
+            lowered.user_data,
+            vec![
+                UserData {
+                    index: 16,
+                    slot: 2,
+                    root: RootType::Table,
+                    dword: 0,
+                },
+                UserData {
+                    index: 18,
+                    slot: 3,
+                    root: RootType::Constants,
+                    dword: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spilled_constants_stay_uniform_in_wave64_compute() {
+        use crate::native::{ComputeIo, RootParam, RootType};
+
+        let mut words = vec![
+            0x8703_FF01,
+            0x0000_00ff, // s_and_b32 s3, s1, 0xff
+            0xBE82_0300, // s_mov_b32 s2, s0
+        ];
+        // s_load_dword s4, s[2:3], 0x00 -> user_data 16 (Constants, slot 0)
+        words.extend_from_slice(&smem_load(0x00, 4, 2, 125, 0x00));
+        // Branch on spilled constant s4, then readfirstlane(v0) and store to LDS (an effect).
+        words.extend_from_slice(&[
+            0xBF06_8004, // s_cmp_eq_u32 s4, 0
+            0xBF85_0004, // s_cbranch_scc1 -> +4 dwords (S_ENDPGM)
+            0x7E0A_0500, // v_readfirstlane_b32 s5, v0
+            v_mov_b32(1, 5),
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ]);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (2 << 1) | (1 << 15), // 2 user SGPRs (s[0:1]), 512 B LDS
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_readfirstlane_b32")
+        );
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = super::lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            options: super::TranslateOptions {
+                wave64: super::Wave64Mode::Wave32,
+            },
+        })
+        .unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone()).unwrap();
+        }
+        assert_eq!(lowered.user_data.len(), 1);
+        assert_eq!(lowered.user_data[0].index, 16);
     }
 }
