@@ -132,6 +132,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    poke_f32(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -177,6 +178,64 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// Debugging aid: `VICTORY_POKE_F32=<rva>=<value>,...` (rva hex) writes an f32 at each title+rva before the
+/// title starts, e.g. to loosen a timeout constant while bring-up is slow. The page keeps its protection.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn poke_f32(base: usize, size: usize) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualProtect(at: *mut core::ffi::c_void, len: usize, new: u32, old: *mut u32) -> i32;
+    }
+    const PAGE_READWRITE: u32 = 0x04;
+    let Ok(list) = std::env::var("VICTORY_POKE_F32") else {
+        return;
+    };
+    for item in list.split(',') {
+        let Some((rva, value)) = item.split_once('=') else { continue };
+        // `<rva>=hex:<bytes>` writes raw bytes instead (e.g. `hex:9090`).
+        if let Some(hex) = value.trim().strip_prefix("hex:") {
+            let Ok(rva) = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16) else { continue };
+            let bytes: Vec<u8> = (0..hex.len() / 2)
+                .filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok())
+                .collect();
+            if bytes.is_empty() || rva + bytes.len() > size {
+                continue;
+            }
+            let at = (base + rva) as *mut u8;
+            let mut old: u32 = 0;
+            // SAFETY: inside the mapped image, checked above; protection restored after.
+            unsafe {
+                if VirtualProtect(at.cast(), bytes.len(), 0x40, &mut old) != 0 {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
+                    VirtualProtect(at.cast(), bytes.len(), old, &mut old);
+                    eprintln!("VIctory: title+{rva:#x} patched {} bytes", bytes.len());
+                }
+            }
+            continue;
+        }
+        let (Ok(rva), Ok(value)) = (
+            usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16),
+            value.trim().parse::<f32>(),
+        ) else {
+            continue;
+        };
+        if rva + 4 > size {
+            continue;
+        }
+        let at = (base + rva) as *mut f32;
+        let mut old: u32 = 0;
+        // SAFETY: four bytes inside the mapped image, checked above; protection restored after.
+        unsafe {
+            if VirtualProtect(at.cast(), 4, PAGE_READWRITE, &mut old) != 0 {
+                let before = at.read_unaligned();
+                at.write_unaligned(value);
+                VirtualProtect(at.cast(), 4, old, &mut old);
+                eprintln!("VIctory: title+{rva:#x} f32 {before} -> {value}");
+            }
+        }
+    }
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.

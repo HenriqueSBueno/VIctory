@@ -121,10 +121,25 @@ fn rectangle_pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
+/// The clamp's source; a diagnostics build takes `VICTORY_MESH_GROUP_CAP` (1..65535) as the most groups one indirect
+/// mesh dispatch keeps, to tell a dispatch made huge by bad arguments from slow shaders.
+fn clamp_source() -> String {
+    #[cfg(feature = "diagnostics")]
+    if let Some(cap) = std::env::var("VICTORY_MESH_GROUP_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&c| (1..=65535).contains(&c))
+    {
+        tracing::warn!(cap, "indirect mesh dispatches capped (diagnostics)");
+        return SOURCE.replace("min(g.x, 65535u)", &format!("min(g.x, {cap}u)"));
+    }
+    SOURCE.to_owned()
+}
+
 fn clamp() -> Option<&'static Pass> {
     static CLAMP: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make(SOURCE, "argument clamp") {
+        .get_or_init(|| match make(&clamp_source(), "argument clamp") {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
