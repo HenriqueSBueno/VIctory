@@ -589,18 +589,23 @@ impl State {
             for u in &t.host.user_data {
                 let v = self.user_value(compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
-                let is_view_table = u.root == RootType::Table
-                    && matches!(
-                        self.roots_ref(compute).get(usize::from(u.slot)),
-                        Some(Root::Table(h))
-                            if self.heaps[0] != 0
-                                && crate::descriptor::heap(self.heaps[0] as This)
-                                    .index(*h)
-                                    .is_some()
-                    );
-                if is_view_table {
+                if let (RootType::Table, Some(Root::Table(handle))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                    && self.heaps[0] != 0
+                    && crate::descriptor::heap(self.heaps[0] as This)
+                        .index(*handle)
+                        .is_some()
+                {
                     let index = v / 32;
                     if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
+                        if slot == "null" {
+                            crate::descriptor::note_unknown_handle(
+                                index,
+                                *handle,
+                                u.slot,
+                                Some(u.index),
+                            );
+                        }
                         let _ = write!(text, " [heap {index}: {slot}]");
                     }
                 }
@@ -707,6 +712,11 @@ impl State {
             let (Some(host), Some(base_index)) = (heap.host(), heap.index(table)) else {
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            let user_index = user_data
+                .iter()
+                .find(|u| u.root == RootType::Table && u.slot == slot)
+                .map(|u| u.index);
             let step = heap.step();
             let slot_dwords = (step / 4).max(1);
             let entries: Vec<&UsedResource> = used
@@ -760,6 +770,8 @@ impl State {
                                 step,
                                 count,
                                 &mut self.sync_scratch,
+                                #[cfg(feature = "diagnostics")]
+                                (slot, user_index),
                             );
                             for i in 0..self.sync_scratch.len() {
                                 let (k, sync) = &self.sync_scratch[i];
@@ -788,6 +800,14 @@ impl State {
                             if !ranges.iter().any(|rg| rg.start <= rel && rel < rg.end)
                                 && let Some(idx) = heap.index(handle)
                             {
+                                #[cfg(feature = "diagnostics")]
+                                if !heap.samplers()
+                                    && crate::descriptor::slot_record(handle).is_none()
+                                {
+                                    crate::descriptor::note_unknown_handle(
+                                        idx, handle, slot, user_index,
+                                    );
+                                }
                                 host.mirror(idx, handle, true);
                             }
                             if let Some(view) = crate::descriptor::view(handle)
@@ -872,9 +892,8 @@ impl State {
                             .copied();
                         let range_kind = range_kind_at(&ranges, k);
                         let at = table + u64::from(k) * u64::from(step);
-                        let record = heap
-                            .index(at)
-                            .and_then(|_| crate::descriptor::slot_record(at));
+                        let heap_idx = heap.index(at);
+                        let record = heap_idx.and_then(|_| crate::descriptor::slot_record(at));
                         let view = record.and_then(|_| crate::descriptor::view(at));
                         match view {
                             Some(View::Constant(address, size)) => {
@@ -906,6 +925,15 @@ impl State {
                             None => {
                                 if record.is_some() {
                                     stale = true;
+                                } else {
+                                    #[cfg(feature = "diagnostics")]
+                                    if !heap.samplers()
+                                        && let Some(idx) = heap_idx
+                                    {
+                                        crate::descriptor::note_unknown_handle(
+                                            idx, at, slot, user_index,
+                                        );
+                                    }
                                 }
                                 host.make_null(index);
                                 if used_u.is_some() {

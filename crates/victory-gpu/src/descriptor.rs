@@ -172,6 +172,142 @@ pub(crate) fn slot_record(handle: u64) -> Option<[u32; 3]> {
     (record[0] == VIEW_TAG && record[2] != 0).then_some(record)
 }
 
+/// Maximum number of distinct first-dword patterns logged for unrecognised
+/// 32-byte descriptor table slots in diagnostics builds.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) const UNKNOWN_SLOT_LOG_LIMIT: usize = 64;
+
+/// Classification of the 8 little-endian dwords (32 bytes) in a view
+/// descriptor heap slot.
+#[cfg(any(feature = "diagnostics", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotRecord {
+    /// All 32 bytes are zero.
+    Zero,
+    /// VIctory's own `[VIEW_TAG, index, generation]` record (`generation != 0`).
+    Victory { index: u32, generation: u32 },
+    /// Non-zero bytes that are not a recognised VIctory descriptor record.
+    Unrecognised([u32; 8]),
+}
+
+/// Classifies the 8 dwords of a 32-byte view descriptor slot in title memory.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) fn classify_slot(dwords: [u32; 8]) -> SlotRecord {
+    if dwords == [0; 8] {
+        SlotRecord::Zero
+    } else if dwords[0] == VIEW_TAG && dwords[2] != 0 {
+        SlotRecord::Victory {
+            index: dwords[1],
+            generation: dwords[2],
+        }
+    } else {
+        SlotRecord::Unrecognised(dwords)
+    }
+}
+
+/// Formats an 8-dword descriptor slot as zero-padded hex words.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) fn format_dwords(dwords: &[u32; 8]) -> String {
+    format!(
+        "[{:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}, {:#010x}]",
+        dwords[0], dwords[1], dwords[2], dwords[3], dwords[4], dwords[5], dwords[6], dwords[7]
+    )
+}
+
+/// Bounded deduplicating filter for unrecognised descriptor slot patterns,
+/// keyed by the first dword (`dwords[0]`).
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) struct UnknownSlotLog {
+    seen: Vec<u32>,
+    limit: usize,
+}
+
+#[cfg(any(feature = "diagnostics", test))]
+impl UnknownSlotLog {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self {
+            seen: Vec::new(),
+            limit,
+        }
+    }
+
+    /// Returns `true` the first time `first_dword` is seen while under the
+    /// cap.
+    pub(crate) fn should_log(&mut self, first_dword: u32) -> bool {
+        if self.seen.len() >= self.limit || self.seen.contains(&first_dword) {
+            return false;
+        }
+        self.seen.push(first_dword);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static UNKNOWN_SLOTS: std::sync::Mutex<UnknownSlotLog> =
+    std::sync::Mutex::new(UnknownSlotLog::new(UNKNOWN_SLOT_LOG_LIMIT));
+
+#[cfg(feature = "diagnostics")]
+static UNKNOWN_SLOT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Logs an unrecognised non-zero 32-byte table slot once per distinct
+/// first-dword pattern (up to [`UNKNOWN_SLOT_LOG_LIMIT`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_unknown_dwords(
+    heap_index: u32,
+    dwords: [u32; 8],
+    root_param: u8,
+    user_data: Option<u32>,
+) {
+    use std::sync::atomic::Ordering;
+    if UNKNOWN_SLOT_COUNT.load(Ordering::Relaxed) >= UNKNOWN_SLOT_LOG_LIMIT {
+        return;
+    }
+    let SlotRecord::Unrecognised(dwords) = classify_slot(dwords) else {
+        return;
+    };
+    let should = {
+        let mut log = UNKNOWN_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = log.should_log(dwords[0]);
+        if ok {
+            UNKNOWN_SLOT_COUNT.store(log.seen.len(), Ordering::Relaxed);
+        }
+        ok
+    };
+    if should {
+        tracing::warn!(
+            heap_index,
+            root_param,
+            ?user_data,
+            dwords = %format_dwords(&dwords),
+            "unrecognised non-zero descriptor slot in table"
+        );
+    }
+}
+
+/// Reads 32 bytes from a live view descriptor heap slot at `handle` and logs it
+/// if it is neither all zero nor a recognised VIctory descriptor record.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_unknown_handle(
+    heap_index: u32,
+    handle: u64,
+    root_param: u8,
+    user_data: Option<u32>,
+) {
+    if handle == 0
+        || UNKNOWN_SLOT_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= UNKNOWN_SLOT_LOG_LIMIT
+    {
+        return;
+    }
+    // SAFETY: callers pass a handle inside a live 32-byte view heap slot.
+    let dwords = unsafe { (handle as *const [u32; 8]).read_unaligned() };
+    note_unknown_dwords(heap_index, dwords, root_param, user_data);
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
@@ -853,5 +989,61 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn classify_slot_distinguishes_zero_victory_and_unrecognised() {
+        assert_eq!(classify_slot([0; 8]), SlotRecord::Zero);
+
+        let victory = [VIEW_TAG, 7, 1, 0, 0, 0, 0, 0];
+        assert_eq!(
+            classify_slot(victory),
+            SlotRecord::Victory {
+                index: 7,
+                generation: 1
+            }
+        );
+
+        let victory_trailing = [VIEW_TAG, 7, 1, 0xdead_beef, 1, 2, 3, 4];
+        assert_eq!(
+            classify_slot(victory_trailing),
+            SlotRecord::Victory {
+                index: 7,
+                generation: 1
+            }
+        );
+
+        let zero_gen = [VIEW_TAG, 7, 0, 0, 0, 0, 0, 0];
+        assert_eq!(classify_slot(zero_gen), SlotRecord::Unrecognised(zero_gen));
+
+        let nonzero_tail = [0, 0x1000, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            classify_slot(nonzero_tail),
+            SlotRecord::Unrecognised(nonzero_tail)
+        );
+
+        let raw_hw = [0x1234_5678, 1, 0x100, 0x9000_0fac, 0, 0, 0, 0];
+        assert_eq!(classify_slot(raw_hw), SlotRecord::Unrecognised(raw_hw));
+    }
+
+    #[test]
+    fn unknown_slot_log_deduplicates_first_dword_and_enforces_limit() {
+        assert_eq!(UNKNOWN_SLOT_LOG_LIMIT, 64);
+        let mut log = UnknownSlotLog::new(3);
+        assert!(log.should_log(0x1111_0000));
+        assert!(!log.should_log(0x1111_0000));
+        assert!(log.should_log(0x2222_0000));
+        assert!(log.should_log(0x3333_0000));
+        assert!(!log.should_log(0x4444_0000));
+        assert_eq!(log.len(), 3);
+    }
+
+    #[test]
+    fn format_dwords_formats_all_eight_words_in_hex() {
+        let dwords = [0, 1, 0x1234_abcd, 0xffff_ffff, 0x10, 0x20, 0x30, 0x40];
+        assert_eq!(
+            format_dwords(&dwords),
+            "[0x00000000, 0x00000001, 0x1234abcd, 0xffffffff, 0x00000010, 0x00000020, 0x00000030, 0x00000040]"
+        );
     }
 }

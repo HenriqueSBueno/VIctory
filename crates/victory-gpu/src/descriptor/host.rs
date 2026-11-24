@@ -40,6 +40,8 @@ pub(crate) trait MirrorBackend {
     fn is_buffer(&self, view: &View) -> bool;
     fn make_view(&self, index: u32, view: &View, later: bool) -> Option<SlotSync>;
     fn make_null(&self, index: u32);
+    #[cfg(feature = "diagnostics")]
+    fn note_unknown(&self, _index: u32, _handle: u64) {}
 }
 
 /// Per-slot cache of the title descriptor record `(generation << 32) | index`
@@ -165,6 +167,10 @@ impl MirrorCache {
                 0
             };
             if key == 0 {
+                #[cfg(feature = "diagnostics")]
+                if for_draw {
+                    backend.note_unknown(first + k, handle);
+                }
                 if self.made[idx] != 0 {
                     self.clear_slot(idx);
                     backend.make_null(first + k);
@@ -791,7 +797,11 @@ impl HostHeap {
 
 }
 
-struct HostBackend<'a>(&'a HostHeap);
+struct HostBackend<'a> {
+    heap: &'a HostHeap,
+    #[cfg(feature = "diagnostics")]
+    diag: Option<(u8, Option<u32>)>,
+}
 
 impl MirrorBackend for HostBackend<'_> {
     fn lookup(&self, i: u32, generation: u32) -> Option<(View, u64)> {
@@ -814,18 +824,27 @@ impl MirrorBackend for HostBackend<'_> {
         let kept = if later {
             None
         } else {
-            make(view, self.0.cpu(index))
+            make(view, self.heap.cpu(index))
         };
         let made = kept.is_some();
-        if !made && !self.0.sampler {
-            null_for(view, self.0.cpu(index));
+        if !made && !self.heap.sampler {
+            null_for(view, self.heap.cpu(index));
         }
-        self.0.keep(index, kept.flatten());
+        self.heap.keep(index, kept.flatten());
         made.then(|| slot_sync(view)).flatten()
     }
 
     fn make_null(&self, index: u32) {
-        self.0.make_null(index);
+        self.heap.make_null(index);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn note_unknown(&self, index: u32, handle: u64) {
+        if !self.heap.sampler
+            && let Some((root_param, user_data)) = self.diag
+        {
+            super::note_unknown_handle(index, handle, root_param, user_data);
+        }
     }
 }
 
@@ -886,7 +905,19 @@ impl HostHeap {
             return;
         }
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        cache.sync_range(index, handle, 0, 1, for_draw, &HostBackend(self), None);
+        cache.sync_range(
+            index,
+            handle,
+            0,
+            1,
+            for_draw,
+            &HostBackend {
+                heap: self,
+                #[cfg(feature = "diagnostics")]
+                diag: None,
+            },
+            None,
+        );
     }
 
     /// Mirrors `count` contiguous title descriptor slots starting at
@@ -899,6 +930,7 @@ impl HostHeap {
         step: u32,
         count: u32,
         out_syncs: &mut Vec<(u32, SlotSync)>,
+        #[cfg(feature = "diagnostics")] root: (u8, Option<u32>),
     ) {
         let avail = self.count.saturating_sub(first);
         let count = count.min(avail);
@@ -913,7 +945,11 @@ impl HostHeap {
             step,
             count,
             true,
-            &HostBackend(self),
+            &HostBackend {
+                heap: self,
+                #[cfg(feature = "diagnostics")]
+                diag: Some(root),
+            },
             Some(out_syncs),
         );
     }
@@ -1540,6 +1576,8 @@ mod tests {
         epoch: AtomicU64,
         entries: Mutex<std::collections::HashMap<(u32, u32), View>>,
         ops: Mutex<Vec<MockOp>>,
+        #[cfg(feature = "diagnostics")]
+        unknown: Mutex<Vec<(u32, u64)>>,
     }
 
     impl MockBackend {
@@ -1552,6 +1590,8 @@ mod tests {
                 epoch: AtomicU64::new(1),
                 entries: Mutex::new(entries),
                 ops: Mutex::new(Vec::new()),
+                #[cfg(feature = "diagnostics")]
+                unknown: Mutex::new(Vec::new()),
             }
         }
 
@@ -1604,6 +1644,11 @@ mod tests {
 
         fn make_null(&self, index: u32) {
             self.ops.lock().unwrap().push(MockOp::MakeNull(index));
+        }
+
+        #[cfg(feature = "diagnostics")]
+        fn note_unknown(&self, index: u32, handle: u64) {
+            self.unknown.lock().unwrap().push((index, handle));
         }
     }
 
@@ -1721,6 +1766,25 @@ mod tests {
         cache.sync_range(0, base, 0, 1, true, &backend, None);
         assert_eq!(backend.take_ops(), vec![MockOp::MakeView(0, false)]);
         assert!(cache.is_made(0));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn mirror_cache_sync_range_notes_unknown_slots_only_for_draws() {
+        let srv = View::Shader(0x1000, None);
+        let backend = MockBackend::new(&[(1, 1, srv)]);
+        let mut cache = MirrorCache::new(8);
+        let mut heap = [[0u32; 8]; 3];
+        write_rec(&mut heap[0], 1, 1);
+        heap[1] = [0xabcd_1234, 2, 0x10, 0x9000_0fac, 0, 0, 0, 0];
+        let base = heap.as_ptr() as u64;
+
+        cache.sync_range(4, base, 32, 3, false, &backend, None);
+        assert!(backend.unknown.lock().unwrap().is_empty());
+
+        cache.sync_range(4, base, 32, 3, true, &backend, None);
+        let noted = std::mem::take(&mut *backend.unknown.lock().unwrap());
+        assert_eq!(noted, vec![(5, base + 32), (6, base + 64)]);
     }
 
     #[test]
